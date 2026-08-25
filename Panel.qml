@@ -91,12 +91,38 @@ Panel {
   readonly property int total: summary.total
   readonly property string worstSeverity: summary.worstSeverity
 
+  // Collapsed/expanded state per repo, keyed by path (stable across a
+  // refresh even though `repos` itself is a freshly-built array each time).
+  // Every repo starts collapsed — that's the whole point of this map, so a
+  // long project list doesn't dump every finding on screen at once; the
+  // severity-count row below the header covers "is this one a problem"
+  // without expanding it.
+  property var expandedPaths: ({})
+
+  function isExpanded(path) {
+    return root.expandedPaths[path] === true
+  }
+
+  function toggleExpanded(path) {
+    // Reassign a new object rather than mutate in place — `expandedPaths`
+    // is a plain `property var`, and QML only fires change notifications
+    // (which `isExpanded` bindings depend on to update) on reassignment.
+    var next = {}
+    for (var k in root.expandedPaths) next[k] = root.expandedPaths[k]
+    next[path] = !root.expandedPaths[path]
+    root.expandedPaths = next
+  }
+
   function refresh() {
     if (root.projects.length === 0) {
       root.repos = []
       return
     }
-    if (auditProc.running) return
+    // Guards against auditProc too: both it and singleProc write into
+    // `root.repos` on completion (one wholesale, one by index), so letting
+    // a bulk and a single-project refresh run concurrently risks one
+    // overwriting the other's result with stale data.
+    if (auditProc.running || singleProc.running) return
     root.refreshing = true
     auditProc.command = ["bash", "-c", Model.buildAuditScript(root.projects)]
     auditProc.running = true
@@ -109,6 +135,39 @@ Panel {
       onStreamFinished: {
         root.repos = Model.parseAuditOutput(String(text || ""), root.projects)
         root.refreshing = false
+        root.lastRefreshedAt = Date.now()
+      }
+    }
+  }
+
+  // ---- Per-project rescan: re-runs just one repo's audit instead of every
+  //      configured project. Reuses buildAuditScript/parseAuditOutput with
+  //      a single-element projects array — the marker index it encodes is
+  //      local to that array (always 0), which is fine since parsing that
+  //      output only ever needs to line up with the same one-element array,
+  //      not the repo's real position in the full list.
+  property int singleRefreshIndex: -1
+
+  function refreshOne(index) {
+    if (index < 0 || index >= root.projects.length) return
+    if (auditProc.running || singleProc.running) return
+    root.singleRefreshIndex = index
+    singleProc.command = ["bash", "-c", Model.buildAuditScript([root.projects[index]])]
+    singleProc.running = true
+  }
+
+  Process {
+    id: singleProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var idx = root.singleRefreshIndex
+        root.singleRefreshIndex = -1
+        if (idx < 0 || idx >= root.projects.length || idx >= root.repos.length) return
+        var updated = Model.parseAuditOutput(String(text || ""), [root.projects[idx]])
+        var next = root.repos.slice()
+        next[idx] = updated[0]
+        root.repos = next
         root.lastRefreshedAt = Date.now()
       }
     }
@@ -211,15 +270,27 @@ Panel {
             font.italic: true
           }
 
-          // ---- One section per configured repo.
+          // ---- One collapsible section per configured repo. Collapsed by
+          //      default: the severity-count row right under the header is
+          //      what keeps a long project list from being a wall of
+          //      findings — it answers "is this one a problem" without
+          //      expanding it. Click the header to expand for the full
+          //      finding list; click the rescan glyph to re-audit just this
+          //      repo instead of every configured project.
           Repeater {
             model: root.repos
 
             Column {
               id: repoSection
               required property var modelData
+              required property int index
               width: bodyCol.width
               spacing: Style.space(6)
+
+              readonly property bool expanded: root.isExpanded(modelData.path)
+              readonly property var counts: Model.countBySeverity(modelData.findings)
+              readonly property bool hasFindings: modelData.status === "ok" && modelData.findings.length > 0
+              readonly property bool refreshingThis: root.singleRefreshIndex === index
 
               Rectangle {
                 width: parent.width
@@ -228,31 +299,123 @@ Panel {
                 opacity: 0.12
               }
 
-              Row {
-                spacing: Style.space(8)
+              // ---- Header: chevron + severity dot + label + path on the
+              //      left, rescan glyph pinned to the right. The whole row
+              //      is the expand/collapse click target; the rescan glyph
+              //      is a descendant declared after that background
+              //      MouseArea, so it stacks on top for hit-testing (same
+              //      pattern the finding rows below use for their id/CVE
+              //      link over the copy-fix background).
+              Item {
+                id: headerRow
+                width: parent.width
+                height: labelRow.implicitHeight
 
-                Rectangle {
-                  width: Style.space(8)
-                  height: Style.space(8)
-                  radius: width / 2
-                  anchors.verticalCenter: parent.verticalCenter
-                  color: Model.severityColor(repoSection.modelData.worstSeverity) || Qt.darker(root.fg, 1.6)
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleExpanded(repoSection.modelData.path)
+                }
+
+                // `headerLeft` is an Item, not a Row: a Row sizes itself to
+                // its children's natural widths and won't shrink them, so
+                // anchoring it between the chevron and the rescan glyph
+                // wouldn't actually constrain (and elide) a long path — it
+                // would just overflow past the rescan glyph. Packing the
+                // fixed-size icons/label in their own inner Row and giving
+                // the path Text real anchors (left of the inner row's
+                // right edge, right at headerLeft's edge) is what makes
+                // elide have a real width to work against.
+                Item {
+                  id: headerLeft
+                  anchors.left: parent.left
+                  anchors.right: rescanBtn.left
+                  anchors.rightMargin: Style.space(8)
+                  height: labelRow.implicitHeight
+
+                  Row {
+                    id: labelRow
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+
+                    Text {
+                      text: repoSection.expanded ? "▾" : "▸"
+                      color: Qt.darker(root.fg, 1.4)
+                      font.family: root.fontFam
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Rectangle {
+                      width: Style.space(8)
+                      height: Style.space(8)
+                      radius: width / 2
+                      anchors.verticalCenter: parent.verticalCenter
+                      color: Model.severityColor(repoSection.modelData.worstSeverity) || Qt.darker(root.fg, 1.6)
+                    }
+
+                    Text {
+                      text: repoSection.modelData.label
+                      color: root.fg
+                      font.family: root.fontFam
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+                  }
+
+                  Text {
+                    anchors.left: labelRow.right
+                    anchors.leftMargin: Style.space(8)
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: repoSection.modelData.path
+                    color: Qt.darker(root.fg, 1.6)
+                    font.family: root.fontFam
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideMiddle
+                  }
                 }
 
                 Text {
-                  text: repoSection.modelData.label
-                  color: root.fg
+                  id: rescanBtn
+                  anchors.right: parent.right
+                  anchors.verticalCenter: headerLeft.verticalCenter
+                  text: repoSection.refreshingThis ? "…" : "⟳"
+                  color: rescanArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
                   font.family: root.fontFam
                   font.pixelSize: Style.font.body
-                  font.bold: true
-                }
 
-                Text {
-                  text: repoSection.modelData.path
-                  color: Qt.darker(root.fg, 1.6)
-                  font.family: root.fontFam
-                  font.pixelSize: Style.font.caption
-                  anchors.verticalCenter: parent.verticalCenter
+                  MouseArea {
+                    id: rescanArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.refreshOne(repoSection.index)
+                  }
+                }
+              }
+
+              // ---- Severity-count summary, visible whether collapsed or
+              //      expanded (it's the whole point of collapsing).
+              Row {
+                spacing: Style.space(6)
+                visible: repoSection.hasFindings
+
+                Repeater {
+                  model: ["critical", "high", "moderate", "low", "unknown"]
+
+                  Text {
+                    required property string modelData
+                    visible: repoSection.counts[modelData] > 0
+                    text: repoSection.counts[modelData] + " " + modelData
+                    color: Model.severityColor(modelData) || Qt.darker(root.fg, 1.5)
+                    font.family: root.fontFam
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
                 }
               }
 
@@ -267,9 +430,9 @@ Panel {
                 width: parent.width
               }
 
-              // ---- Findings for this repo.
+              // ---- Findings for this repo — only rendered when expanded.
               Repeater {
-                model: repoSection.modelData.findings
+                model: repoSection.expanded ? repoSection.modelData.findings : []
 
                 Rectangle {
                   id: findingItem

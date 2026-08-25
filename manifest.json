@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.thomasvez.depaudit",
   "name": "Dependency Audit",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "author": "Thomas Vezirop (thomasvez)",
   "license": "MIT",
   "description": "Bar badge aggregating dependency security/staleness (CVEs, outdated packages) across a configured list of local project directories. Detects the package manager per repo and shells out to its native audit tool.",

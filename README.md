@@ -9,9 +9,24 @@ you work in, so you don't have to remember to run `npm audit` /
 
 No dashboard, no daemon: a shield icon in the bar shows the total finding
 count, color-coded by worst severity. Clicking it opens a per-repo
-breakdown — package name, current vs. fixed version, severity, the CVE
-number (or native advisory id when no CVE was assigned), and a click-to-copy
-fix command.
+breakdown, one collapsible section per project — a severity-count summary
+(e.g. "2 critical  1 high") whether collapsed or expanded, and the full
+list when expanded: package name, current vs. fixed version, severity, the
+CVE number (or native advisory id when no CVE was assigned), and a
+click-to-copy fix command.
+
+![Panel preview: one expanded repo section showing two npm findings with
+severity, CVE/GHSA links, and copy-fix commands, plus two collapsed
+sections below showing their severity-count summaries](preview.png)
+
+The screenshot above is a real capture against the plugin's own demo data
+(project labels literally say "remove me" — that's this repo's own
+throwaway test fixtures, not a hint about anything). Top section expanded:
+two real advisories against an intentionally old `minimist`, one moderate
+and one critical, each with its own CVE-preferred link and copy-fix
+command. Below it, two collapsed sections — a clean repo, and one with a
+single moderate cargo finding — showing what the severity-count summary
+line looks like without expanding anything.
 
 ## Install
 
@@ -26,6 +41,10 @@ omarchy plugin add https://github.com/thomasvez/omarchy-depaudit.git --enable
   project's audit now
 - **Right click**: send the current summary as a desktop notification —
   glanceable without opening the panel at all
+- **Click a repo's header** in the panel: expand/collapse its finding list
+  (starts collapsed; the severity-count row next to the header stays
+  visible either way)
+- **Click the ⟳ next to a repo's header**: re-audit just that one project
 - **Click a finding**'s CVE/advisory id in the panel: open that advisory's
   page in the browser
 - **Click anywhere else** on a finding: copy its fix command to the

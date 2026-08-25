@@ -595,6 +595,18 @@ function aggregate(repos) {
   return { total: total, worstSeverity: worst }
 }
 
+// Per-severity finding count for one repo — the collapsed-section summary
+// (e.g. "2 critical  1 high") so a project doesn't need to be expanded just
+// to see whether it's a problem.
+function countBySeverity(findings) {
+  var counts = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 }
+  for (var i = 0; i < findings.length; i++) {
+    var s = findings[i].severity
+    if (counts[s] !== undefined) counts[s]++
+  }
+  return counts
+}
+
 // Bar-pill text: icon is added by the widget, this is just the count (or
 // nothing when clean, so a healthy state doesn't shout a "0").
 function badgeLabel(total) {
@@ -639,6 +651,7 @@ if (typeof module !== "undefined") {
     parseDotnetAudit: parseDotnetAudit,
     normalizeSeverity: normalizeSeverity,
     aggregate: aggregate,
+    countBySeverity: countBySeverity,
     badgeLabel: badgeLabel,
     severityColor: severityColor,
     notificationSummary: notificationSummary

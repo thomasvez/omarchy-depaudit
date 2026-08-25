@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0
+
+- Repo sections are now collapsible, collapsed by default. A severity-count
+  row (e.g. "2 critical  1 high") sits right under each header whether
+  collapsed or expanded, so a long project list doesn't dump every finding
+  on screen at once — click a header to expand it for the full list.
+- Added per-project rescan: a small ⟳ glyph on each header re-audits just
+  that one repo instead of every configured project. Reuses
+  `buildAuditScript`/`parseAuditOutput` with a single-element projects
+  array and splices the result back into `repos` at the right index.
+- Bulk refresh and a per-project rescan now guard against running
+  concurrently — both write into `repos` on completion (one wholesale, one
+  by index), so letting them overlap risked one clobbering the other's
+  result.
+
 ## 0.5.0
 
 - Added Ruby support: `Gemfile.lock` → `bundle-audit check --format json`
