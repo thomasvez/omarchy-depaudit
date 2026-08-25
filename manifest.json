@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.thomasvez.depaudit",
+  "name": "Dependency Audit",
+  "version": "0.3.0",
+  "author": "Thomas Vezirop (thomasvez)",
+  "license": "MIT",
+  "description": "Bar badge aggregating dependency security/staleness (CVEs, outdated packages) across a configured list of local project directories. Detects the package manager per repo and shells out to its native audit tool.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Dependency Audit",
+    "description": "CVE/outdated-package badge across your projects",
+    "category": "Dev",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
