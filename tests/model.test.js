@@ -16,6 +16,7 @@
 const test = require("node:test")
 const assert = require("node:assert/strict")
 const fs = require("node:fs")
+const os = require("node:os")
 const path = require("node:path")
 const { execFileSync } = require("node:child_process")
 
@@ -154,9 +155,9 @@ test("buildAuditScript skips entries with an empty path", () => {
   assert.equal(script, Model.buildAuditScript([]))
 })
 
-test("buildAuditScript on an empty project list is just the PATH prefix", () => {
+test("buildAuditScript on an empty project list is just the setup prefix", () => {
   const script = Model.buildAuditScript([])
-  assert.match(script, /^export PATH=.*\$PATH"; $/)
+  assert.match(script, /^export PATH=.*\$PATH"; mkdir -p .*omarchy-depaudit; $/)
 })
 
 // ---- parseJsonStream -------------------------------------------------
@@ -192,6 +193,38 @@ test("parseNpmAudit: one finding per distinct GHSA advisory, not just the first"
     assert.equal(f.fixCommand, "npm install minimist@1.2.8")
     assert.match(f.url, /^https:\/\/github\.com\/advisories\/GHSA-/)
   }
+})
+
+test("parsePnpmAudit: reads the legacy per-advisory-id schema, real severity", () => {
+  const findings = Model.parsePnpmAudit(fixtureJson("pnpm-audit.json"))
+  assert.equal(findings.length, 2)
+  const bySeverity = Object.fromEntries(findings.map(f => [f.severity, f]))
+  assert.equal(bySeverity.moderate.id, "GHSA-vh95-rmgr-6w4m")
+  assert.equal(bySeverity.critical.id, "GHSA-xvch-5gv4-984h")
+  for (const f of findings) {
+    assert.equal(f.package, "minimist")
+    assert.equal(f.range, "0.0.8")
+    assert.equal(f.fixCommand, "pnpm update minimist")
+  }
+})
+
+test("parseYarnAudit: reads newline-delimited JSON, prefers the real cves array", () => {
+  const findings = Model.parseYarnAudit(fixture("yarn-audit.json"))
+  assert.equal(findings.length, 2)
+  const bySeverity = Object.fromEntries(findings.map(f => [f.severity, f]))
+  // yarn's advisory carries a real `cves` array unlike pnpm's/npm's shape —
+  // pickCveAlias should win over the GHSA id here.
+  assert.equal(bySeverity.moderate.id, "CVE-2020-7598")
+  assert.equal(bySeverity.critical.id, "CVE-2021-44906")
+  for (const f of findings) {
+    assert.equal(f.package, "minimist")
+    assert.equal(f.fixCommand, "yarn upgrade minimist")
+  }
+})
+
+test("parseYarnAudit ignores non-auditAdvisory lines (auditSummary, etc.)", () => {
+  const stream = '{"type":"info","data":"whatever"}\n{"type":"auditSummary","data":{}}\n'
+  assert.deepEqual(Model.parseYarnAudit(stream), [])
 })
 
 test("parseCargoAudit: scores CVSS into a real severity and links to RustSec", () => {
@@ -267,16 +300,19 @@ test("parseAuditOutput routes each marked chunk to the right parser by manager t
   assert.equal(repos[1].findings.length, 1)
 })
 
-test("parseAuditOutput: missing-tool and unknown-manifest statuses carry no findings", () => {
-  const projects = [{ label: "a", path: "/x/a" }, { label: "b", path: "/x/b" }]
+test("parseAuditOutput: missing-tool, missing-path, and unknown-manifest carry no findings", () => {
+  const projects = [{ label: "a", path: "/x/a" }, { label: "b", path: "/x/b" }, { label: "c", path: "/x/c" }]
   const raw = Model.REPO_MARKER + "0|missing:cargo-audit\n"
     + Model.REPO_MARKER + "1|unknown\n"
+    + Model.REPO_MARKER + "2|missing-path\n"
   const repos = Model.parseAuditOutput(raw, projects)
   assert.equal(repos[0].status, "missing-tool")
   assert.equal(repos[0].tool, "cargo-audit")
   assert.equal(repos[0].findings.length, 0)
   assert.equal(repos[1].status, "unrecognized")
   assert.equal(repos[1].findings.length, 0)
+  assert.equal(repos[2].status, "missing-path")
+  assert.equal(repos[2].findings.length, 0)
 })
 
 test("parseAuditOutput: malformed JSON body yields parse-error, not a crash", () => {
@@ -302,19 +338,207 @@ test("parseAuditOutput: a project with no matching chunk stays pending", () => {
 // under bash, and REPO_MARKER round-trips correctly end to end through a
 // real shell.
 
-test("a generated script actually runs correctly under bash", () => {
+test("a generated script correctly reports missing-path for a nonexistent project", () => {
   const projects = [
-    { label: "has space", path: "/tmp/depaudit-test-dir with space" },
-    { label: "has quote", path: "/tmp/depaudit-test-dir-it's-here" }
+    { label: "has space", path: "/tmp/depaudit-definitely-nonexistent dir with space" },
+    { label: "has quote", path: "/tmp/depaudit-definitely-nonexistent-dir-it's-here" }
   ]
   const script = Model.buildAuditScript(projects)
   const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
   const repos = Model.parseAuditOutput(stdout, projects)
   assert.equal(repos.length, 2)
-  assert.equal(repos[0].status, "unrecognized")
-  assert.equal(repos[1].status, "unrecognized")
+  assert.equal(repos[0].status, "missing-path")
+  assert.equal(repos[1].status, "missing-path")
+})
+
+test("a generated script runs correctly under bash for a real path with special characters", () => {
+  // Real, unique temp dirs (not just nonexistent path strings) with a
+  // space and an embedded single quote in the name — this is what
+  // actually exercises buildAuditScript's quoting under bash end to end;
+  // the nonexistent-path test above only exercises the `[ ! -d ]` branch.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-test-it's-"))
+  try {
+    const projects = [{ label: "special chars", path: dir }]
+    const script = Model.buildAuditScript(projects)
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const repos = Model.parseAuditOutput(stdout, projects)
+    assert.equal(repos.length, 1)
+    assert.equal(repos[0].status, "unrecognized")
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("defaultProjects is an empty array", () => {
   assert.deepEqual(Model.defaultProjects(), [])
+})
+
+// ---- Ignore/dismiss --------------------------------------------------
+
+test("ignoreKey scopes by repo path, not just finding id", () => {
+  assert.notEqual(Model.ignoreKey("/repo/a", "CVE-1"), Model.ignoreKey("/repo/b", "CVE-1"))
+})
+
+test("toggleIgnored flips membership without mutating the input map", () => {
+  const original = {}
+  const once = Model.toggleIgnored(original, "/repo/a", "CVE-1")
+  assert.equal(Model.isIgnored(once, "/repo/a", "CVE-1"), true)
+  assert.deepEqual(original, {}, "input map must not be mutated in place")
+
+  const twice = Model.toggleIgnored(once, "/repo/a", "CVE-1")
+  assert.equal(Model.isIgnored(twice, "/repo/a", "CVE-1"), false)
+})
+
+test("toggleIgnored scopes to the exact repo — ignoring in one repo leaves another untouched", () => {
+  const map = Model.toggleIgnored({}, "/repo/a", "CVE-1")
+  assert.equal(Model.isIgnored(map, "/repo/a", "CVE-1"), true)
+  assert.equal(Model.isIgnored(map, "/repo/b", "CVE-1"), false)
+})
+
+test("markIgnored annotates findings and drops ignored ones from worstSeverity", () => {
+  const repos = [{
+    path: "/repo/a",
+    findings: [
+      { id: "CVE-1", severity: "critical" },
+      { id: "CVE-2", severity: "low" }
+    ],
+    worstSeverity: "critical"
+  }]
+  const ignoredMap = Model.toggleIgnored({}, "/repo/a", "CVE-1")
+  const [marked] = Model.markIgnored(repos, ignoredMap)
+
+  assert.equal(marked.findings.find(f => f.id === "CVE-1").ignored, true)
+  assert.equal(marked.findings.find(f => f.id === "CVE-2").ignored, false)
+  assert.equal(marked.findings.length, 2, "ignored findings stay in the list, not deleted")
+  assert.equal(marked.worstSeverity, "low", "worst severity now reflects only the non-ignored finding")
+})
+
+test("aggregate/countBySeverity exclude ignored findings from totals", () => {
+  const repos = [{
+    path: "/repo/a",
+    findings: [
+      { id: "CVE-1", severity: "critical" },
+      { id: "CVE-2", severity: "low" }
+    ],
+    worstSeverity: "critical"
+  }]
+  const [marked] = Model.markIgnored(repos, Model.toggleIgnored({}, "/repo/a", "CVE-1"))
+  assert.deepEqual(Model.aggregate([marked]), { total: 1, worstSeverity: "low" })
+  assert.deepEqual(Model.countBySeverity(marked.findings), { critical: 0, high: 0, moderate: 0, low: 1, unknown: 0 })
+})
+
+// ---- New-since-last-scan detection ----------------------------------------
+
+test("computeNewFindings: no baseline yet means nothing counts as new (first scan)", () => {
+  const repos = [{ path: "/repo/a", label: "a", status: "ok", findings: [{ id: "CVE-1", package: "x" }] }]
+  const { newFindings, nextLastSeen } = Model.computeNewFindings(repos, {})
+  assert.deepEqual(newFindings, [])
+  assert.deepEqual(nextLastSeen, { "/repo/a": ["CVE-1"] })
+})
+
+test("computeNewFindings: flags an id absent from the previous baseline", () => {
+  const repos = [{ path: "/repo/a", label: "a", status: "ok", findings: [
+    { id: "CVE-1", package: "x" }, { id: "CVE-2", package: "y" }
+  ] }]
+  const { newFindings, nextLastSeen } = Model.computeNewFindings(repos, { "/repo/a": ["CVE-1"] })
+  assert.equal(newFindings.length, 1)
+  assert.equal(newFindings[0].finding.id, "CVE-2")
+  assert.deepEqual(nextLastSeen["/repo/a"], ["CVE-1", "CVE-2"])
+})
+
+test("computeNewFindings: a failed scan doesn't touch that repo's baseline", () => {
+  const repos = [{ path: "/repo/a", label: "a", status: "missing-tool", findings: [] }]
+  const { newFindings, nextLastSeen } = Model.computeNewFindings(repos, { "/repo/a": ["CVE-1"] })
+  assert.deepEqual(newFindings, [])
+  assert.deepEqual(nextLastSeen["/repo/a"], ["CVE-1"], "baseline preserved, not wiped to []")
+})
+
+test("computeNewFindings: a single-repo call preserves other repos' baselines untouched", () => {
+  const repos = [{ path: "/repo/a", label: "a", status: "ok", findings: [{ id: "CVE-2", package: "x" }] }]
+  const existing = { "/repo/a": ["CVE-1"], "/repo/b": ["CVE-9"] }
+  const { nextLastSeen } = Model.computeNewFindings(repos, existing)
+  assert.deepEqual(nextLastSeen["/repo/b"], ["CVE-9"])
+})
+
+test("newFindingsSummary names up to 2 findings and counts the rest", () => {
+  assert.equal(Model.newFindingsSummary([]), "")
+  const one = [{ finding: { package: "requests", id: "CVE-1" } }]
+  assert.equal(Model.newFindingsSummary(one), "1 new finding: requests (CVE-1)")
+  const four = [
+    { finding: { package: "a", id: "CVE-1" } },
+    { finding: { package: "b", id: "CVE-2" } },
+    { finding: { package: "c", id: "CVE-3" } },
+    { finding: { package: "d", id: "CVE-4" } }
+  ]
+  assert.equal(Model.newFindingsSummary(four), "4 new findings: a (CVE-1), b (CVE-2) +2 more")
+})
+
+// ---- Auto-discovery --------------------------------------------------
+
+test("discovery finds real projects under a root and prunes node_modules", () => {
+  // A self-contained fixture tree (not this machine's own demo state, which
+  // wouldn't exist on a fresh CI runner): two real projects plus a
+  // node_modules directory holding a third-party package's own
+  // package.json, which discovery must NOT report as a project.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-discovery-"))
+  try {
+    fs.mkdirSync(path.join(root, "webapp"), { recursive: true })
+    fs.writeFileSync(path.join(root, "webapp", "package.json"), "{}")
+    fs.mkdirSync(path.join(root, "webapp", "node_modules", "some-dep"), { recursive: true })
+    fs.writeFileSync(path.join(root, "webapp", "node_modules", "some-dep", "package.json"), "{}")
+
+    fs.mkdirSync(path.join(root, "cli-tool"), { recursive: true })
+    fs.writeFileSync(path.join(root, "cli-tool", "Cargo.toml"), "")
+
+    const script = Model.buildDiscoveryScript([root])
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const discovered = Model.parseDiscoveredProjects(stdout)
+    const labels = discovered.map(d => d.label).sort()
+    assert.deepEqual(labels, ["cli-tool", "webapp"])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("parseDiscoveredProjects dedupes multiple manifest matches in the same directory", () => {
+  const raw = "/root/a/package.json\n/root/a/package.json\n/root/b/Cargo.toml\n"
+  const discovered = Model.parseDiscoveredProjects(raw)
+  assert.equal(discovered.length, 2)
+})
+
+test("mergeProjects: explicit config wins over discovery on a path collision", () => {
+  const explicit = [{ label: "My Custom Label", path: "/repo/a" }]
+  const discovered = [{ label: "a", path: "/repo/a" }, { label: "b", path: "/repo/b" }]
+  const merged = Model.mergeProjects(explicit, discovered)
+  assert.equal(merged.length, 2)
+  assert.equal(merged.find(p => p.path === "/repo/a").label, "My Custom Label")
+  assert.ok(merged.find(p => p.path === "/repo/b"))
+})
+
+// ---- In-panel settings form text <-> data conversion ----------------------
+
+test("parseProjectsText: label|path, bare path, blank lines, and empty-path lines dropped", () => {
+  const text = "work-api | /home/you/work/api\n/home/you/personal/site\n\nweird | \nno-pipe-path"
+  assert.deepEqual(Model.parseProjectsText(text), [
+    { label: "work-api", path: "/home/you/work/api" },
+    { path: "/home/you/personal/site" },
+    { path: "no-pipe-path" }
+  ])
+})
+
+test("projectsToText/parseProjectsText round-trip", () => {
+  const projects = [{ label: "a", path: "/x" }, { path: "/y" }]
+  assert.deepEqual(Model.parseProjectsText(Model.projectsToText(projects)), projects)
+})
+
+test("parseRootsText trims and drops blank lines", () => {
+  assert.deepEqual(
+    Model.parseRootsText("/home/you/Development\n\n  /home/you/work  \n"),
+    ["/home/you/Development", "/home/you/work"]
+  )
+})
+
+test("rootsToText/parseRootsText round-trip", () => {
+  const roots = ["/a", "/b"]
+  assert.deepEqual(Model.parseRootsText(Model.rootsToText(roots)), roots)
 })

@@ -1,19 +1,23 @@
 # Dependency Audit
 
-A bar badge for the [Omarchy](https://omarchy.org/) shell that watches a
-configured list of local project directories for dependency security and
-staleness — outdated packages and known CVEs — aggregated across every repo
-you work in, so you don't have to remember to run `npm audit` /
+A bar badge for the [Omarchy](https://omarchy.org/) shell that watches your
+project directories for dependency security and staleness — outdated
+packages and known CVEs — aggregated across every repo you work in, so you
+don't have to remember to run `npm audit` / `pnpm audit` / `yarn audit` /
 `cargo audit` / `pip-audit` / `govulncheck` / `bundle-audit` /
-`dotnet list package --vulnerable` in each one yourself.
+`dotnet list package --vulnerable` in each one yourself. Point it at a
+directory and it finds your projects on its own (or list them by hand, or
+both).
 
 No dashboard, no daemon: a shield icon in the bar shows the total finding
-count, color-coded by worst severity. Clicking it opens a per-repo
+count, color-coded by worst severity, and only notifies when something
+*new* shows up — not on every routine scan. Clicking it opens a per-repo
 breakdown, one collapsible section per project — a severity-count summary
 (e.g. "2 critical  1 high") whether collapsed or expanded, and the full
 list when expanded: package name, current vs. fixed version, severity, the
 CVE number (or native advisory id when no CVE was assigned), and a
-click-to-copy fix command.
+click-to-copy fix command. Findings you've already triaged can be dismissed
+without losing track of them.
 
 ![Panel preview: one expanded repo section showing two npm findings with
 severity, CVE/GHSA links, and copy-fix commands, plus two collapsed
@@ -41,40 +45,72 @@ omarchy plugin add https://github.com/thomasvez/omarchy-depaudit.git --enable
   project's audit now
 - **Right click**: send the current summary as a desktop notification —
   glanceable without opening the panel at all
+- **Click the ⚙ in the panel header**: open the settings form — edit icon,
+  refresh interval, discover roots, and projects without touching
+  shell.json (**✕** or **Cancel** discards changes, **Save** persists them)
 - **Click a repo's header** in the panel: expand/collapse its finding list
   (starts collapsed; the severity-count row next to the header stays
   visible either way)
 - **Click the ⟳ next to a repo's header**: re-audit just that one project
 - **Click a finding**'s CVE/advisory id in the panel: open that advisory's
   page in the browser
+- **Click "Dismiss"** on a finding: exclude it from the badge count and
+  severity summary without deleting it — it stays in the list, dimmed,
+  with the control now reading "Restore"
 - **Click anywhere else** on a finding: copy its fix command to the
   clipboard
 
+A desktop notification also fires on its own — no click needed — whenever
+a scan turns up a finding that wasn't there last time, so you don't have to
+be watching the bar to notice something new.
+
 ## Configure
 
-Nothing runs until you configure at least one project. Add a `projects`
-entry to this widget's block in `~/.config/omarchy/shell.json` (hot-reloads
-on save):
+Nothing runs until you configure at least one project, either by hand or by
+pointing the widget at a directory to search. Easiest: click the **⚙** in
+the panel — it edits the same settings described below without touching a
+config file. Or add either (or both) to this widget's block in
+`~/.config/omarchy/shell.json` directly (hot-reloads on save):
 
 ```json
 {
   "id": "io.github.thomasvez.depaudit",
   "refreshIntervalMinutes": 60,
+  "discoverRoots": [
+    "/home/you/Development"
+  ],
   "projects": [
-    { "label": "omarchy-depaudit", "path": "/home/you/Development/Omarchy/omarchy-depaudit" },
     { "label": "work-api", "path": "/home/you/work/api" }
   ]
 }
 ```
 
-- `projects` — the repos to watch, top to bottom in the panel.
+- `discoverRoots` — absolute directory paths to search (depth 3) for
+  recognized manifests, so you don't have to list every project by hand.
+  Dependency/build-output directories (`node_modules`, `.git`, `target`,
+  `vendor`, `.venv`/`venv`, `bin`, `obj`, `build`) are pruned, so it won't
+  waste time descending into an already-found project's own dependency
+  tree. Re-run at the top of every refresh, so a project added later under
+  a configured root shows up on its own. Must be absolute — `~` isn't
+  expanded, same constraint as `projects[].path` below.
+- `projects` — explicitly-listed repos, top to bottom in the panel. Wins
+  over a `discoverRoots` match on the same path (so you can override just
+  one discovered project's label without listing everything by hand).
   - `path` — absolute path to the project's root directory.
   - `label` — display name in the panel; defaults to `path` if omitted.
-- `refreshIntervalMinutes` — how often every repo re-audits in the
-  background. Default `60`. Set `0` to disable the recurring timer and rely
-  on middle-click / the `r` key instead — audits shell out to package
-  registries, so there's a real cost to running them often.
+- `refreshIntervalMinutes` — how often every repo re-audits (and
+  `discoverRoots` re-scans) in the background. Default `60`. Set `0` to
+  disable the recurring timer and rely on middle-click / the `r` key
+  instead — audits shell out to package registries, so there's a real cost
+  to running them often.
 - `icon` — bar glyph, default `🛡`.
+
+Dismissed findings and each repo's "last seen" baseline (for new-finding
+notifications) are stored separately from this config, at
+`~/.local/state/omarchy-depaudit/state.json` — not something you're
+expected to hand-edit, but delete it if you ever want a clean slate (every
+finding un-dismissed, next scan's findings treated as a fresh baseline
+rather than compared against history).
 
 Move it in the bar:
 
@@ -84,11 +120,19 @@ omarchy bar move io.github.thomasvez.depaudit --section right
 
 ## How detection works
 
-For each configured project, in order:
+For each configured (or discovered) project, first checked: does the path
+exist at all? A typo'd or moved/deleted project shows "path does not
+exist" rather than being misreported as missing a manifest. Then, in
+order:
 
 1. `Cargo.toml` present → `cargo audit --json` (needs `cargo-audit`
    installed: `cargo install cargo-audit`).
-2. `package.json` present → `npm audit --json` (needs `npm`).
+2. `package.json` present → checks the lockfile to pick the right tool,
+   since auditing with the wrong one can resolve a different dependency
+   tree than what's actually installed:
+   - `pnpm-lock.yaml` → `pnpm audit --json` (needs `pnpm`).
+   - `yarn.lock` → `yarn audit --json` (needs `yarn`).
+   - neither → `npm audit --json` (needs `npm`).
 3. `requirements.txt` present → `pip-audit --format json -r requirements.txt`,
    or `pyproject.toml` present → `pip-audit --format json .` (needs
    `pip-audit`: `pip install pip-audit`).
@@ -111,19 +155,15 @@ If the matching tool isn't on `PATH`, that repo shows "not found on PATH"
 instead of a false "clean" result — a missing tool is never silently
 treated as zero vulnerabilities.
 
-No network calls happen outside what each audit tool itself makes (`npm
-audit`, `pip-audit`, `govulncheck`, and `dotnet list package --vulnerable`
-query their registries/vuln DBs; `cargo audit` and `bundle-audit` check a
-local advisory-DB clone each downloads on first run). The plugin itself
-doesn't talk to any server.
+No network calls happen outside what each audit tool itself makes (`npm`,
+`pnpm`, `yarn`, `pip-audit`, `govulncheck`, and
+`dotnet list package --vulnerable` query their registries/vuln DBs;
+`cargo audit` and `bundle-audit` check a local advisory-DB clone each
+downloads on first run). The plugin itself doesn't talk to any server —
+`discoverRoots` search is a local `find`, nothing more.
 
 ## Known limitations
 
-- **pnpm / yarn**: a `package.json` repo always runs plain `npm audit`,
-  even when its lockfile is `pnpm-lock.yaml` or `yarn.lock`. This can
-  resolve a different dependency tree than what's actually installed.
-  Native `pnpm audit` / `yarn npm audit` support is a follow-up — their
-  JSON shapes differ from npm's and aren't parsed yet.
 - **Severity on pip/go/.NET findings**: `pip-audit` and `govulncheck` don't
   include any severity data in their JSON output (unlike npm's
   critical/high/moderate/low). Their findings are shown as `unknown`

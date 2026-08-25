@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.8.0
+
+- Added an in-panel settings form: click the ⚙ next to the header to edit
+  `icon`, `refreshIntervalMinutes`, `discoverRoots`, and `projects` without
+  hand-editing shell.json. `discoverRoots`/`projects` are edited as plain
+  multi-line text (one entry per line, `label | path` for projects) rather
+  than a dynamic add/remove list — far less QML, and copy-paste friendly.
+  Saves through `bar.shell.updateEntryInline` — the same first-party
+  mechanism the bar's own drag-to-reorder uses to persist a widget's inline
+  settings — rather than a bespoke shell.json write of our own.
+- The multi-line fields use a small custom component (plain `TextEdit` in a
+  themed `Rectangle`+`Flickable`) since qs.Ui has no multi-line control to
+  reuse; styled only with helpers already proven working elsewhere in this
+  file (`Qt.darker`, `Util.alpha`, `Color.accent`) rather than the kit's
+  internal `Style.controlFill`/`Border.controlSpec`, whose exact signatures
+  weren't independently verified.
+- `PanelKeyCatcher` is now blocked while the settings form is open — it
+  intercepts keys before children by design (`Keys.priority:
+  Keys.BeforeItem`), and without this, typing "r" into any settings field
+  would also trigger a refresh.
+- Verified live: opened the form via a temporary debug trigger (no
+  `ydotool` available in this environment to click the real gear icon) and
+  confirmed the draft fields populate with the actual configured values —
+  not just defaults — including a real `discoverRoots` path and a real
+  `projects` entry formatted exactly as `Model.rootsToText`/
+  `projectsToText` produce them.
+- 4 new tests (51 total) for the settings-text conversion helpers
+  (`parseProjectsText`/`projectsToText`/`parseRootsText`/`rootsToText`).
+- Widened the panel (420px → 600px) — paths and the new settings fields
+  need the room. Considered making the panel open centered on the whole
+  screen rather than anchored below the bar; every panel in this shell
+  (weather, tailscale, network, ...) is built on a shared component that
+  only centers along the bar's own axis, never vertically for a top bar,
+  so true center-of-screen would mean a custom popup losing that
+  component's free outside-click dismiss / multi-monitor handling /
+  keyboard-focus / bar-popout-coordination — stayed with the shared
+  component and its bar-anchored (but now wider) positioning instead.
+
+## 0.7.0
+
+- Added pnpm and yarn (classic) support. A `package.json` repo now checks
+  its lockfile: `pnpm-lock.yaml` → `pnpm audit --json` (npm's *legacy*
+  per-advisory-id schema, not the per-package one npm 7+ uses — verified
+  against a real pnpm 11.24 run), `yarn.lock` → `yarn audit --json`
+  (newline-delimited JSON, one object per line — verified against a real
+  yarn 1.22 run), else plain `npm audit` as before. Fixes the known gap
+  where a pnpm/yarn project silently ran npm's audit against a lockfile
+  that wasn't actually the resolved one.
+- Fixed a real bug: a configured project whose path doesn't exist at all
+  (typo, moved/deleted repo) fell through every manifest check and was
+  misreported as "no recognized manifest" — same message as a real project
+  genuinely missing one. Now checked first and reported distinctly.
+- Added project auto-discovery: a `discoverRoots` array of directory paths
+  gets walked (depth 3, dependency/build directories like `node_modules`
+  pruned) for recognized manifests, merged with any explicit `projects`
+  entries. Re-run at the top of every refresh, so a project added later
+  under a configured root shows up without a shell.json edit.
+- Added ignore/dismiss: click "Dismiss" on a finding to exclude it from the
+  badge count and severity summary without deleting it from the list —
+  reversible via "Restore". Persisted locally (not into shell.json) at
+  `~/.local/state/omarchy-depaudit/state.json`, scoped per repo+finding so
+  dismissing a CVE in one project doesn't affect the same CVE elsewhere.
+- Added proactive new-finding notifications: after any scan, findings not
+  present in that repo's previous successful scan trigger one desktop
+  notification for the batch. A repo's first-ever scan never counts as
+  "new" (would notify on every fresh install), and a scan that fails
+  (missing-tool, parse-error) leaves that repo's baseline untouched rather
+  than reading "found nothing because it errored" as "everything got
+  fixed". Verified live: introduced a real new CVE into a previously-clean
+  demo repo, rescanned, and confirmed the exact expected message
+  ("2 new findings: minimist (GHSA-...), minimist (GHSA-...)") in the
+  system notification history.
+- 13 new tests (47 total) covering every addition above, including a
+  self-contained temp-directory fixture for discovery (portable to CI,
+  not dependent on this machine's own demo state).
+
 ## 0.6.1
 
 - Added a real automated test suite (`tests/model.test.js`, Node's built-in

@@ -65,8 +65,19 @@ function markerEcho(index, manager) {
 // terminal). Prepending common per-user toolchain bin dirs here means a
 // freshly-installed audit tool works without requiring a full logout/login
 // — cheap and harmless even when a given directory doesn't exist.
+//
+// Also creates the plugin's own state directory (ignored findings,
+// last-seen finding ids for new-finding notifications — see Panel.qml's
+// stateFile). This runs before every generated script, bulk or per-project,
+// so the directory is guaranteed to exist by the time anything could
+// possibly try to write into it — a QML FileView can't create missing
+// parent directories itself, and the alternative (an async execDetached
+// "mkdir -p" fired right before the first write) would race that write on
+// a fresh install. `mkdir -p` is idempotent, so re-running it every scan is
+// harmless.
+var STATE_DIR = "$HOME/.local/state/omarchy-depaudit"
 var PATH_PREFIX = "export PATH=\"$HOME/.cargo/bin:$HOME/go/bin:$HOME/.local/bin:"
-  + "$HOME/.local/share/mise/shims:$HOME/.dotnet:$PATH\"; "
+  + "$HOME/.local/share/mise/shims:$HOME/.dotnet:$PATH\"; mkdir -p " + STATE_DIR + "; "
 
 function buildAuditScript(projects) {
   var parts = []
@@ -76,16 +87,42 @@ function buildAuditScript(projects) {
     var qPath = shellQuote(path)
 
     parts.push(
-      "if [ -f " + qPath + "/Cargo.toml ]; then" +
+      // Checked before anything else: every branch below assumes the path
+      // exists and just tests for a manifest file inside it. A path that
+      // doesn't exist at all (typo, moved/deleted project, unmounted drive)
+      // would otherwise silently fall through every `[ -f ]` check and land
+      // in "no recognized manifest" — a misleading answer, since the real
+      // problem is the path itself, not what's (or isn't) in it.
+      "if [ ! -d " + qPath + " ]; then " + markerEcho(i, "missing-path") + ";" +
+      "elif [ -f " + qPath + "/Cargo.toml ]; then" +
       " if command -v cargo-audit >/dev/null 2>&1; then" +
       "  " + markerEcho(i, "cargo") + ";" +
       "  (cd " + qPath + " && cargo audit --json 2>/dev/null);" +
       " else " + markerEcho(i, "missing:cargo-audit") + "; fi;" +
+      // Lockfile decides which of the three JS package managers actually
+      // resolved this tree — a pnpm/yarn project audited with plain `npm
+      // audit` can resolve a different dependency tree than what's really
+      // installed. pnpm's JSON is npm's *legacy* per-advisory-id schema
+      // (verified against a real pnpm 11.24 run — different from npm 7+'s
+      // per-package schema handled elsewhere); yarn classic's `--json` is
+      // newline-delimited JSON (one object per line), not one document.
       "elif [ -f " + qPath + "/package.json ]; then" +
-      " if command -v npm >/dev/null 2>&1; then" +
-      "  " + markerEcho(i, "npm") + ";" +
-      "  (cd " + qPath + " && npm audit --json 2>/dev/null);" +
-      " else " + markerEcho(i, "missing:npm") + "; fi;" +
+      " if [ -f " + qPath + "/pnpm-lock.yaml ]; then" +
+      "  if command -v pnpm >/dev/null 2>&1; then" +
+      "   " + markerEcho(i, "pnpm") + ";" +
+      "   (cd " + qPath + " && pnpm audit --json 2>/dev/null);" +
+      "  else " + markerEcho(i, "missing:pnpm") + "; fi;" +
+      " elif [ -f " + qPath + "/yarn.lock ]; then" +
+      "  if command -v yarn >/dev/null 2>&1; then" +
+      "   " + markerEcho(i, "yarn") + ";" +
+      "   (cd " + qPath + " && yarn audit --json 2>/dev/null);" +
+      "  else " + markerEcho(i, "missing:yarn") + "; fi;" +
+      " else" +
+      "  if command -v npm >/dev/null 2>&1; then" +
+      "   " + markerEcho(i, "npm") + ";" +
+      "   (cd " + qPath + " && npm audit --json 2>/dev/null);" +
+      "  else " + markerEcho(i, "missing:npm") + "; fi;" +
+      " fi;" +
       // `-r requirements.txt` / the project_path positional are required:
       // bare `pip-audit` with no target audits pip-audit's OWN Python
       // environment, not the repo being checked.
@@ -173,6 +210,9 @@ function parseAuditOutput(raw, projects) {
 function parseRepoBlock(label, path, manager, body) {
   var base = { label: plainText(label), path: path, manager: manager }
 
+  if (manager === "missing-path") {
+    return Object.assign(base, { status: "missing-path", findings: [], worstSeverity: "none" })
+  }
   if (manager.indexOf("missing:") === 0) {
     return Object.assign(base, {
       status: "missing-tool",
@@ -185,13 +225,16 @@ function parseRepoBlock(label, path, manager, body) {
     return Object.assign(base, { status: "unrecognized", findings: [], worstSeverity: "none" })
   }
 
-  // govulncheck's `-json` output is a stream of concatenated top-level JSON
-  // values, not one document — JSON.parse would throw on it, so "go" is
-  // parsed straight from the raw text via parseJsonStream rather than
-  // through the single JSON.parse the other managers use.
+  // govulncheck's `-json` and yarn classic's `audit --json` are both NOT a
+  // single JSON document — govulncheck concatenates top-level values with
+  // no separator, yarn newline-delimits one object per line — so both are
+  // parsed straight from the raw text rather than through the single
+  // JSON.parse the other managers use.
   var findings
   if (manager === "go") {
     findings = parseGoAudit(body)
+  } else if (manager === "yarn") {
+    findings = parseYarnAudit(body)
   } else {
     var json = null
     try {
@@ -200,6 +243,7 @@ function parseRepoBlock(label, path, manager, body) {
       return Object.assign(base, { status: "parse-error", findings: [], worstSeverity: "none" })
     }
     if (manager === "npm") findings = parseNpmAudit(json)
+    else if (manager === "pnpm") findings = parsePnpmAudit(json)
     else if (manager === "cargo") findings = parseCargoAudit(json)
     else if (manager === "pip") findings = parsePipAudit(json)
     else if (manager === "ruby") findings = parseRubyAudit(json)
@@ -272,6 +316,68 @@ function parseNpmAudit(json) {
         fixCommand: fixCommand
       })
     }
+  }
+  return out
+}
+
+// pnpm audit --json: NOT npm 7+'s per-package `vulnerabilities` schema —
+// pnpm uses the older npm-legacy shape, `{advisories: {"<numericId>":
+// {module_name, severity, title, github_advisory_id, url,
+// patched_versions, findings: [{version, ...}]}}}` (verified against a
+// real pnpm 11.24 run). pnpm's severity is real (moderate/critical, etc.),
+// no scoring needed. `patched_versions` is a range like cargo's, not an
+// exact version, so the fix command stays a generic `pnpm update <pkg>`.
+function parsePnpmAudit(json) {
+  var out = []
+  var advisories = (json && json.advisories) || {}
+  for (var key in advisories) {
+    var a = advisories[key]
+    var findingRows = Array.isArray(a.findings) ? a.findings : []
+    var version = findingRows.length > 0 ? findingRows[0].version : ""
+    out.push({
+      package: a.module_name || "",
+      severity: normalizeSeverity(a.severity),
+      range: version,
+      fixedVersion: a.patched_versions || null,
+      id: a.github_advisory_id || (a.id !== undefined ? String(a.id) : ""),
+      title: a.title || "",
+      url: a.url || "",
+      fixCommand: "pnpm update " + (a.module_name || "")
+    })
+  }
+  return out
+}
+
+// yarn (classic 1.x) audit --json: newline-delimited JSON, one
+// `{type, data}` object per line — verified against a real yarn 1.22 run.
+// Only `type: "auditAdvisory"` lines are per-package findings; the rest
+// (`auditSummary`, etc.) are skipped. Richer than pnpm's/npm's shape: a
+// real `cves` array (pickCveAlias-preferred over the GHSA id) and even a
+// CVSS vector, though the vector isn't scored here since `severity` is
+// already given directly. `patched_versions` is a range, same generic
+// `yarn upgrade <pkg>` fix command as pnpm/cargo.
+function parseYarnAudit(rawText) {
+  var out = []
+  var lines = String(rawText || "").split("\n")
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (line === "") continue
+    var obj
+    try { obj = JSON.parse(line) } catch (e) { continue }
+    if (obj.type !== "auditAdvisory") continue
+    var a = (obj.data && obj.data.advisory) || {}
+    var findingRows = Array.isArray(a.findings) ? a.findings : []
+    var version = findingRows.length > 0 ? findingRows[0].version : ""
+    out.push({
+      package: a.module_name || "",
+      severity: normalizeSeverity(a.severity),
+      range: version,
+      fixedVersion: a.patched_versions || null,
+      id: pickCveAlias(a.cves) || a.github_advisory_id || "",
+      title: a.title || "",
+      url: a.url || "",
+      fixCommand: "yarn upgrade " + (a.module_name || "")
+    })
   }
   return out
 }
@@ -584,12 +690,20 @@ function normalizeSeverity(value) {
   return "unknown"
 }
 
-// Worst severity across every repo, for the bar badge.
+// Worst severity across every repo, for the bar badge. Ignored findings
+// (see markIgnored) don't count toward the total — dismissing a finding is
+// supposed to quiet the badge, not just gray it out in the panel — but a
+// finding with no `ignored` field at all (every caller before ignore
+// support existed, and every test fixture) is treated as not ignored, so
+// this stays backward compatible.
 function aggregate(repos) {
   var total = 0
   var worst = "none"
   for (var i = 0; i < repos.length; i++) {
-    total += repos[i].findings.length
+    var findings = repos[i].findings || []
+    for (var j = 0; j < findings.length; j++) {
+      if (findings[j].ignored !== true) total++
+    }
     if (SEVERITY_RANK[repos[i].worstSeverity] > SEVERITY_RANK[worst]) worst = repos[i].worstSeverity
   }
   return { total: total, worstSeverity: worst }
@@ -597,14 +711,260 @@ function aggregate(repos) {
 
 // Per-severity finding count for one repo — the collapsed-section summary
 // (e.g. "2 critical  1 high") so a project doesn't need to be expanded just
-// to see whether it's a problem.
+// to see whether it's a problem. Ignored findings are excluded, same
+// reasoning as aggregate().
 function countBySeverity(findings) {
   var counts = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 }
   for (var i = 0; i < findings.length; i++) {
+    if (findings[i].ignored === true) continue
     var s = findings[i].severity
     if (counts[s] !== undefined) counts[s]++
   }
   return counts
+}
+
+// ---- In-panel settings form -------------------------------------------
+//
+// The panel's settings view edits `projects`/`discoverRoots` as plain
+// multi-line text (one entry per line) rather than a dynamic per-row
+// add/remove list widget — far less QML to get right, and it's copy-paste
+// friendly. These pure functions do the two-way conversion so the QML side
+// only ever handles strings.
+
+// "label | path" or just "path" (label optional, defaults to the
+// directory's basename same as discovery does) per line. Blank lines
+// ignored. A line with a "|" but nothing after it is dropped — an empty
+// path is not a usable project entry.
+function parseProjectsText(text) {
+  var lines = String(text || "").split("\n")
+  var out = []
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (line === "") continue
+    var pipeIdx = line.indexOf("|")
+    if (pipeIdx === -1) {
+      out.push({ path: line })
+      continue
+    }
+    var label = line.substring(0, pipeIdx).trim()
+    var path = line.substring(pipeIdx + 1).trim()
+    if (path === "") continue
+    out.push(label === "" ? { path: path } : { label: label, path: path })
+  }
+  return out
+}
+
+function projectsToText(projects) {
+  var lines = []
+  for (var i = 0; i < (projects || []).length; i++) {
+    var p = projects[i]
+    lines.push(p.label ? (p.label + " | " + p.path) : p.path)
+  }
+  return lines.join("\n")
+}
+
+// One absolute path per line, blank lines ignored.
+function parseRootsText(text) {
+  var lines = String(text || "").split("\n")
+  var out = []
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (line !== "") out.push(line)
+  }
+  return out
+}
+
+function rootsToText(roots) {
+  return (roots || []).join("\n")
+}
+
+// ---- Ignore/dismiss a finding ---------------------------------------------
+//
+// Keyed by "<repoPath>|<findingId>" rather than just the finding id: the
+// same CVE can be a direct, must-fix dependency in one repo and an
+// irrelevant dev-only transitive one in another, so dismissing it should be
+// scoped per-repo, not global.
+
+function ignoreKey(path, id) {
+  return String(path || "") + "|" + String(id || "")
+}
+
+function isIgnored(ignoredMap, path, id) {
+  return !!(ignoredMap && ignoredMap[ignoreKey(path, id)])
+}
+
+function toggleIgnored(ignoredMap, path, id) {
+  var next = {}
+  for (var k in ignoredMap) next[k] = ignoredMap[k]
+  var key = ignoreKey(path, id)
+  if (next[key]) delete next[key]
+  else next[key] = true
+  return next
+}
+
+// Annotates every finding with `ignored` per the ignored-map and
+// recomputes each repo's `worstSeverity` from only the non-ignored ones —
+// an ignored critical shouldn't keep coloring a collapsed section's dot
+// red. Findings stay in the list either way (ignored or not): dismissing
+// one is meant to be reversible and visible, not a silent delete.
+function markIgnored(repos, ignoredMap) {
+  var out = []
+  for (var i = 0; i < repos.length; i++) {
+    var repo = repos[i]
+    var findings = (repo.findings || []).map(function(f) {
+      var copy = {}
+      for (var k in f) copy[k] = f[k]
+      copy.ignored = isIgnored(ignoredMap, repo.path, f.id)
+      return copy
+    })
+    var worst = "none"
+    for (var j = 0; j < findings.length; j++) {
+      if (findings[j].ignored) continue
+      if (SEVERITY_RANK[findings[j].severity] > SEVERITY_RANK[worst]) worst = findings[j].severity
+    }
+    var repoCopy = {}
+    for (var rk in repo) repoCopy[rk] = repo[rk]
+    repoCopy.findings = findings
+    repoCopy.worstSeverity = worst
+    out.push(repoCopy)
+  }
+  return out
+}
+
+// ---- New-since-last-scan detection (for proactive notifications) ---------
+//
+// `lastSeenMap` is `{"<repoPath>": ["<findingId>", ...]}`, the id set from
+// each repo's previous successful scan. Only repos included in `repos` get
+// their entry touched — a single-project rescan naturally leaves every
+// other repo's baseline alone — and a repo whose scan didn't succeed this
+// round (missing-tool, parse-error, ...) is skipped entirely rather than
+// having its baseline overwritten: zero findings because the scan *failed*
+// must never be read as "everything got fixed" next time it succeeds.
+// A repo with no prior baseline at all (first scan ever, freshly added to
+// config) reports no new findings — everything found on a first scan is
+// "new" only in a trivial sense that would spam a notification on every
+// fresh install.
+function computeNewFindings(repos, lastSeenMap) {
+  var newFindings = []
+  var nextLastSeen = {}
+  for (var k in lastSeenMap) nextLastSeen[k] = lastSeenMap[k]
+
+  for (var i = 0; i < repos.length; i++) {
+    var repo = repos[i]
+    if (repo.status !== "ok") continue
+    var findings = repo.findings || []
+    var currentIds = []
+    for (var f = 0; f < findings.length; f++) {
+      if (findings[f].id !== "") currentIds.push(findings[f].id)
+    }
+
+    var previousIds = lastSeenMap ? lastSeenMap[repo.path] : undefined
+    if (Array.isArray(previousIds)) {
+      var previousSet = {}
+      for (var p = 0; p < previousIds.length; p++) previousSet[previousIds[p]] = true
+      for (var g = 0; g < findings.length; g++) {
+        if (findings[g].id !== "" && !previousSet[findings[g].id])
+          newFindings.push({ repoLabel: repo.label, finding: findings[g] })
+      }
+    }
+
+    nextLastSeen[repo.path] = currentIds
+  }
+
+  return { newFindings: newFindings, nextLastSeen: nextLastSeen }
+}
+
+// Notification text for a batch of new findings — names up to 2 by package,
+// "+N more" beyond that, so the toast stays short regardless of how many
+// showed up at once.
+function newFindingsSummary(newFindings) {
+  if (!newFindings || newFindings.length === 0) return ""
+  var word = newFindings.length === 1 ? "new finding" : "new findings"
+  var names = []
+  for (var i = 0; i < Math.min(2, newFindings.length); i++) {
+    var f = newFindings[i].finding
+    names.push(f.package + (f.id ? " (" + f.id + ")" : ""))
+  }
+  var extra = newFindings.length > 2 ? " +" + (newFindings.length - 2) + " more" : ""
+  return newFindings.length + " " + word + ": " + names.join(", ") + extra
+}
+
+// ---- Project auto-discovery ------------------------------------------------
+
+// One `find` per configured root, pruning dependency/build-output
+// directories so discovery doesn't spend time descending into an already-
+// discovered project's own node_modules/target/vendor/etc. (which can
+// themselves contain thousands of nested manifests belonging to
+// dependencies, not the user's own projects). Matches the same manifest
+// set buildAuditScript detects. Root paths must be absolute — unlike the
+// shell script buildAuditScript generates, this one never expands `~`
+// (every path here is single-quoted before reaching bash, same as
+// `projects[].path`, specifically so shell metacharacters in a configured
+// root can't be interpreted — quoting and `~`-expansion are mutually
+// exclusive, so this makes the same tradeoff `projects[].path` already
+// makes).
+function buildDiscoveryScript(roots) {
+  var parts = []
+  for (var i = 0; i < roots.length; i++) {
+    var root = String(roots[i] || "")
+    if (root === "") continue
+    var qRoot = shellQuote(root)
+    parts.push(
+      "find " + qRoot + " -maxdepth 3 " +
+      "\\( -name node_modules -o -name .git -o -name target -o -name vendor " +
+      "-o -name .venv -o -name venv -o -name bin -o -name obj -o -name build \\) -prune -o " +
+      "\\( -name Cargo.toml -o -name package.json -o -name requirements.txt " +
+      "-o -name pyproject.toml -o -name go.mod -o -name Gemfile.lock " +
+      "-o -name '*.csproj' -o -name '*.sln' -o -name '*.fsproj' \\) -print 2>/dev/null"
+    )
+  }
+  return parts.join("; ")
+}
+
+// Turns buildDiscoveryScript's output (one manifest file path per line)
+// into {label, path} project entries — one per containing directory, deduped
+// (a repo can trip more than one manifest pattern, e.g. a workspace with
+// both a root package.json and a nested Cargo.toml would otherwise still
+// only collapse duplicates of the *same* directory, not merge distinct
+// sub-projects, which is the intended behavior for a monorepo-style tree).
+function parseDiscoveredProjects(rawText) {
+  var lines = String(rawText || "").split("\n")
+  var seen = {}
+  var out = []
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim()
+    if (line === "") continue
+    var slash = line.lastIndexOf("/")
+    var dir = slash === -1 ? line : line.substring(0, slash)
+    if (dir === "" || seen[dir]) continue
+    seen[dir] = true
+    var labelSlash = dir.lastIndexOf("/")
+    var label = labelSlash === -1 ? dir : dir.substring(labelSlash + 1)
+    out.push({ label: label || dir, path: dir })
+  }
+  return out
+}
+
+// Combines explicit `projects` config with auto-discovered ones, explicit
+// entries winning on a path collision (an explicit label override for a
+// path discovery also would have found takes precedence over discovery's
+// directory-name guess).
+function mergeProjects(explicitProjects, discoveredProjects) {
+  var seen = {}
+  var out = []
+  for (var i = 0; i < explicitProjects.length; i++) {
+    var p = explicitProjects[i]
+    if (p.path) seen[p.path] = true
+    out.push(p)
+  }
+  for (var j = 0; j < discoveredProjects.length; j++) {
+    var d = discoveredProjects[j]
+    if (!seen[d.path]) {
+      seen[d.path] = true
+      out.push(d)
+    }
+  }
+  return out
 }
 
 // Bar-pill text: icon is added by the widget, this is just the count (or
@@ -642,6 +1002,8 @@ if (typeof module !== "undefined") {
     buildAuditScript: buildAuditScript,
     parseAuditOutput: parseAuditOutput,
     parseNpmAudit: parseNpmAudit,
+    parsePnpmAudit: parsePnpmAudit,
+    parseYarnAudit: parseYarnAudit,
     parseCargoAudit: parseCargoAudit,
     cvssBaseSeverity: cvssBaseSeverity,
     parsePipAudit: parsePipAudit,
@@ -652,6 +1014,19 @@ if (typeof module !== "undefined") {
     normalizeSeverity: normalizeSeverity,
     aggregate: aggregate,
     countBySeverity: countBySeverity,
+    parseProjectsText: parseProjectsText,
+    projectsToText: projectsToText,
+    parseRootsText: parseRootsText,
+    rootsToText: rootsToText,
+    ignoreKey: ignoreKey,
+    isIgnored: isIgnored,
+    toggleIgnored: toggleIgnored,
+    markIgnored: markIgnored,
+    computeNewFindings: computeNewFindings,
+    newFindingsSummary: newFindingsSummary,
+    buildDiscoveryScript: buildDiscoveryScript,
+    parseDiscoveredProjects: parseDiscoveredProjects,
+    mergeProjects: mergeProjects,
     badgeLabel: badgeLabel,
     severityColor: severityColor,
     notificationSummary: notificationSummary
