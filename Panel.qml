@@ -129,6 +129,12 @@ Panel {
     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
   }
 
+  function openFindingUrl(url) {
+    var text = String(url || "")
+    if (text === "" || !root.bar) return
+    root.bar.run("omarchy-launch-browser " + Util.shellQuote(text))
+  }
+
   function statusLabel(repo) {
     if (repo.status === "pending") return "Waiting for first audit…"
     if (repo.status === "missing-tool") return "'" + repo.tool + "' not found on PATH — install it to audit this repo"
@@ -274,6 +280,19 @@ Panel {
                   radius: Style.cornerRadius
                   color: findingArea.containsMouse ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
 
+                  // Background click target: anywhere on the row not over a
+                  // more specific control (the id/CVE link below) copies the
+                  // fix command. Declared before findingCol so the column's
+                  // content — including the id link's own MouseArea — stacks
+                  // on top of this one for both painting and hit-testing.
+                  MouseArea {
+                    id: findingArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.copyFixCommand(findingItem.finding.fixCommand)
+                  }
+
                   Column {
                     id: findingCol
                     x: Style.space(6)
@@ -300,6 +319,28 @@ Panel {
                         font.family: root.fontFam
                         font.pixelSize: Style.font.bodySmall
                       }
+
+                      // ---- CVE (preferred) or native advisory id, opening
+                      //      the advisory's page in the browser on click.
+                      //      idArea sits on top of the row's background
+                      //      copy-fix area since this Text is a descendant
+                      //      of findingCol, declared after findingArea.
+                      Text {
+                        visible: findingItem.finding.id !== ""
+                        text: findingItem.finding.id
+                        color: idArea.containsMouse ? Color.accent : Qt.darker(Color.accent, 1.2)
+                        font.family: root.fontFam
+                        font.pixelSize: Style.font.bodySmall
+                        font.underline: idArea.containsMouse
+
+                        MouseArea {
+                          id: idArea
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.openFindingUrl(findingItem.finding.url)
+                        }
+                      }
                     }
 
                     Text {
@@ -318,14 +359,6 @@ Panel {
                       font.family: root.fontFam
                       font.pixelSize: Style.font.caption
                     }
-                  }
-
-                  MouseArea {
-                    id: findingArea
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.copyFixCommand(findingItem.finding.fixCommand)
                   }
                 }
               }

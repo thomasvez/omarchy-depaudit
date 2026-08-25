@@ -203,31 +203,54 @@ function worstOf(findings) {
   return worst
 }
 
+// Advisory aliases (RustSec/OSV/pip-audit/govulncheck all carry an
+// `aliases` array) list every cross-reference — CVE, GHSA, etc. — in no
+// guaranteed order. Not every advisory has a CVE assigned, so this is a
+// preference, not a guarantee: prefer a CVE id for display since it's the
+// one identifier readers universally recognize, fall back to whatever the
+// native source id already is otherwise.
+function pickCveAlias(aliases) {
+  if (!Array.isArray(aliases)) return null
+  for (var i = 0; i < aliases.length; i++) {
+    if (/^CVE-\d{4}-\d+$/i.test(String(aliases[i]))) return aliases[i]
+  }
+  return null
+}
+
 // npm audit --json (npm 7+): top-level `vulnerabilities` keyed by package
 // name, each with severity, range, fixAvailable (object | true | false),
-// and `via` entries that are either dependency-name strings or advisory
-// objects carrying title/url.
+// and `via` entries that are either dependency-name strings (a transitive
+// path segment, not an advisory) or advisory objects carrying title/url.
+// A package can be flagged by more than one *distinct* GHSA advisory at
+// once (verified against a real npm audit run: minimist matched both
+// GHSA-vh95-rmgr-6w4m at moderate and GHSA-xvch-5gv4-984h at critical) —
+// earlier code kept only the first `via` object and silently dropped the
+// rest, undercounting real findings. Emits one finding per advisory object
+// instead. npm's JSON carries no `aliases`/CVE field at all, only a GHSA
+// URL, so `id` here is the GHSA slug pulled from that URL.
 function parseNpmAudit(json) {
   var out = []
   var vulns = (json && json.vulnerabilities) || {}
   for (var name in vulns) {
     var v = vulns[name]
-    var advisory = null
-    if (Array.isArray(v.via)) {
-      for (var i = 0; i < v.via.length; i++) {
-        if (v.via[i] && typeof v.via[i] === "object") { advisory = v.via[i]; break }
-      }
-    }
     var fixedVersion = (v.fixAvailable && typeof v.fixAvailable === "object") ? v.fixAvailable.version : null
-    out.push({
-      package: name,
-      severity: normalizeSeverity(v.severity),
-      range: v.range || "",
-      fixedVersion: fixedVersion,
-      title: advisory ? advisory.title : "",
-      url: advisory ? advisory.url : "",
-      fixCommand: fixedVersion ? ("npm install " + name + "@" + fixedVersion) : "npm audit fix"
-    })
+    var fixCommand = fixedVersion ? ("npm install " + name + "@" + fixedVersion) : "npm audit fix"
+    var advisories = Array.isArray(v.via) ? v.via.filter(function(entry) { return entry && typeof entry === "object" }) : []
+    for (var i = 0; i < advisories.length; i++) {
+      var advisory = advisories[i]
+      var url = advisory.url || ""
+      var slug = url.substring(url.lastIndexOf("/") + 1)
+      out.push({
+        package: name,
+        severity: normalizeSeverity(advisory.severity || v.severity),
+        range: advisory.range || v.range || "",
+        fixedVersion: fixedVersion,
+        id: slug,
+        title: advisory.title || "",
+        url: url,
+        fixCommand: fixCommand
+      })
+    }
   }
   return out
 }
@@ -260,8 +283,16 @@ function parseCargoAudit(json) {
         : (advisory.cvss ? cvssBaseSeverity(advisory.cvss) : "unknown"),
       range: pkg.version || "",
       fixedVersion: patched.length > 0 ? patched[0] : null,
-      title: advisory.title || advisory.id || "",
-      url: advisory.url || "",
+      id: pickCveAlias(advisory.aliases) || advisory.id || "",
+      title: advisory.title || "",
+      // RustSec's own advisory page (verified live: rustsec.org/advisories/
+      // RUSTSEC-2020-0071.html resolves), not `advisory.url` — that field is
+      // whatever external reference the advisory's author happened to pick,
+      // often just a GitHub issue thread on the affected package's repo
+      // rather than a page about the finding itself. pip/go's `url` already
+      // point at their own database's dedicated page (osv.dev, pkg.go.dev);
+      // this makes cargo consistent with them.
+      url: advisory.id ? ("https://rustsec.org/advisories/" + advisory.id + ".html") : (advisory.url || ""),
       fixCommand: "cargo update -p " + (pkg.name || "")
     })
   }
@@ -343,12 +374,16 @@ function parsePipAudit(json) {
     for (var j = 0; j < vulns.length; j++) {
       var vuln = vulns[j]
       var fixes = vuln.fix_versions || []
+      // pip-audit gives no short human title/summary field (only `id` and
+      // a paragraph-length `description`, too long for an inline row), so
+      // `title` stays empty here — the id (CVE-preferred) is the label.
       out.push({
         package: pkg.name || "",
         severity: "unknown",
         range: pkg.version || "",
         fixedVersion: fixes.length > 0 ? fixes[0] : null,
-        title: vuln.id || "",
+        id: pickCveAlias(vuln.aliases) || vuln.id || "",
+        title: "",
         url: vuln.id ? ("https://osv.dev/vulnerability/" + vuln.id) : "",
         fixCommand: fixes.length > 0
           ? ("pip install " + (pkg.name || "") + "==" + fixes[0])
@@ -427,7 +462,8 @@ function parseGoAudit(rawText) {
       severity: "unknown",
       range: trace.version || "",
       fixedVersion: fixed,
-      title: osv.summary || finding.osv || "",
+      id: pickCveAlias(osv.aliases) || finding.osv || "",
+      title: osv.summary || "",
       url: (osv.database_specific && osv.database_specific.url) || (finding.osv ? ("https://pkg.go.dev/vuln/" + finding.osv) : ""),
       fixCommand: fixed ? ("go get " + pkg + "@" + fixed) : ("go get -u " + pkg)
     })
@@ -482,6 +518,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     REPO_MARKER: REPO_MARKER,
     shellQuote: shellQuote,
+    pickCveAlias: pickCveAlias,
     plainText: plainText,
     defaultProjects: defaultProjects,
     buildAuditScript: buildAuditScript,

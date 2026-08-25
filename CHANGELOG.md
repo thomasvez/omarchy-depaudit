@@ -1,6 +1,26 @@
 # Changelog
 
-## 0.3.0
+## 0.4.1
+
+- Cargo findings' link now opens RustSec's own advisory page
+  (`rustsec.org/advisories/<id>.html`, verified live) instead of
+  `advisory.url` — that field is whatever external reference the
+  advisory's author happened to pick, often just a GitHub issue thread on
+  the affected package's own repo rather than a page about the finding
+  itself. pip and go's links already pointed at their own database's
+  dedicated page (osv.dev, pkg.go.dev/vuln); this makes cargo consistent.
+
+## 0.4.0
+
+- Each finding now shows its CVE number (preferring a real `CVE-YYYY-NNNNN`
+  id from the advisory's aliases, falling back to the native source id —
+  GHSA/RUSTSEC/PYSEC/GO — when no CVE was assigned) as a clickable link that
+  opens that advisory's page in the browser.
+- Fixed a real coverage bug found while wiring this up: npm audit's `via`
+  array can hold *multiple distinct* GHSA advisories for one package —
+  verified against a real run where minimist matched both a moderate and a
+  separate critical advisory — and the parser kept only the first, silently
+  dropping the rest. Now emits one finding per advisory.
 
 - Cargo findings now get a real severity instead of a blanket `unknown`:
   `cargo-audit` advisories often carry a CVSS v3.x vector at

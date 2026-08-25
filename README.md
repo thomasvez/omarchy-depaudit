@@ -8,8 +8,9 @@ you work in, so you don't have to remember to run `npm audit` /
 
 No dashboard, no daemon: a shield icon in the bar shows the total finding
 count, color-coded by worst severity. Clicking it opens a per-repo
-breakdown — package name, current vs. fixed version, severity, and a
-click-to-copy fix command.
+breakdown — package name, current vs. fixed version, severity, the CVE
+number (or native advisory id when no CVE was assigned), and a click-to-copy
+fix command.
 
 ## Install
 
@@ -24,7 +25,10 @@ omarchy plugin add https://github.com/thomasvez/omarchy-depaudit.git --enable
   project's audit now
 - **Right click**: send the current summary as a desktop notification —
   glanceable without opening the panel at all
-- **Click a finding** in the panel: copy its fix command to the clipboard
+- **Click a finding**'s CVE/advisory id in the panel: open that advisory's
+  page in the browser
+- **Click anywhere else** on a finding: copy its fix command to the
+  clipboard
 
 ## Configure
 
