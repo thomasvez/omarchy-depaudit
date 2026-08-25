@@ -1,0 +1,8 @@
+{
+  "name": "omarchy-depaudit",
+  "private": true,
+  "description": "Bar badge aggregating dependency security/staleness across your projects, for the Omarchy shell.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

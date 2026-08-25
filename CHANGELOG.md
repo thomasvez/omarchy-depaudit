@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.1
+
+- Added a real automated test suite (`tests/model.test.js`, Node's built-in
+  `node:test`, zero dependencies): 30 tests covering every parser and
+  helper in Model.js. Fixtures under `tests/fixtures/` are real captured
+  output from the actual tools, not hand-written approximations — every
+  parser bug found during development this project's history was caught by
+  testing against real tool output, so the regression tests are built the
+  same way.
+- Added a GitHub Actions workflow (`.github/workflows/test.yml`) running
+  `node --check` and the test suite on every push/PR.
+- Added `.gitignore` (excludes `NOTES.md` — session-briefing scratch, not a
+  project deliverable — plus routine editor/OS cruft) and a minimal
+  `package.json` (`npm test`, zero dependencies).
+
 ## 0.6.0
 
 - Repo sections are now collapsible, collapsed by default. A severity-count

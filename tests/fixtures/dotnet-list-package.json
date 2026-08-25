@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "parameters": "--vulnerable",
+  "sources": [
+    "https://api.nuget.org/v3/index.json"
+  ],
+  "projects": [
+    {
+      "path": "/home/hex0x90/.local/state/omarchy-depaudit-demo/scratch-dotnet/scratch-dotnet.csproj",
+      "frameworks": [
+        {
+          "framework": "net10.0",
+          "topLevelPackages": [
+            {
+              "id": "System.Text.Encodings.Web",
+              "requestedVersion": "4.5.0",
+              "resolvedVersion": "4.5.0",
+              "vulnerabilities": [
+                {
+                  "severity": "Critical",
+                  "advisoryurl": "https://github.com/advisories/GHSA-ghhp-997w-qr28"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+# Session-briefing scratch for AI-assisted development — not a project
+# deliverable, see the file's own first line.
+NOTES.md
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# In case any tooling ever gets added that needs it — Model.js itself has
+# zero dependencies and none are expected.
+node_modules/

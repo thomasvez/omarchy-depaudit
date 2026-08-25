@@ -144,6 +144,22 @@ doesn't talk to any server.
   Ruby, and .NET are covered. There's no single standard audit tool for
   C/C++ dependencies the way the others have one.
 
+## Development
+
+`Model.js` is plain, dependency-free JS — all the audit-script generation
+and JSON parsing runs standalone in Node, no QML/Quickshell involved. The
+QML files (`BarWidget.qml`, `Panel.qml`) are the only pieces that need a
+real Omarchy shell to exercise.
+
+```sh
+npm test
+```
+
+Runs `tests/model.test.js` (Node's built-in `node:test`, no dependencies
+to install) against the fixtures in `tests/fixtures/` — real captured
+output from each tool, not hand-written approximations. A GitHub Actions
+workflow runs the same on every push/PR.
+
 ## Remove
 
 ```sh
