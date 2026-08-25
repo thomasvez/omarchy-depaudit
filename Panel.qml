@@ -138,7 +138,7 @@ Panel {
   function statusLabel(repo) {
     if (repo.status === "pending") return "Waiting for first audit…"
     if (repo.status === "missing-tool") return "'" + repo.tool + "' not found on PATH — install it to audit this repo"
-    if (repo.status === "unrecognized") return "No recognized manifest (package.json / Cargo.toml / requirements.txt / pyproject.toml / go.mod)"
+    if (repo.status === "unrecognized") return "No recognized manifest (package.json / Cargo.toml / requirements.txt / pyproject.toml / go.mod / Gemfile.lock / *.csproj)"
     if (repo.status === "parse-error") return "Could not parse audit output"
     if (repo.status === "ok" && repo.findings.length === 0) return "No known vulnerabilities"
     return ""

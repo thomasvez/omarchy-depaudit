@@ -4,7 +4,8 @@ A bar badge for the [Omarchy](https://omarchy.org/) shell that watches a
 configured list of local project directories for dependency security and
 staleness — outdated packages and known CVEs — aggregated across every repo
 you work in, so you don't have to remember to run `npm audit` /
-`cargo audit` / `pip-audit` / `govulncheck` in each one yourself.
+`cargo audit` / `pip-audit` / `govulncheck` / `bundle-audit` /
+`dotnet list package --vulnerable` in each one yourself.
 
 No dashboard, no daemon: a shield icon in the bar shows the total finding
 count, color-coded by worst severity. Clicking it opens a per-repo
@@ -78,16 +79,24 @@ For each configured project, in order:
    regardless of whether your code actually calls into the vulnerable
    function — matching how npm/cargo/pip audit work, rather than
    govulncheck's default call-graph-reachability mode.
-5. None of the above → shown as "no recognized manifest" in the panel.
+5. `Gemfile.lock` present → `bundle-audit check --format json` (needs
+   `bundler-audit`: `gem install bundler-audit`). Requires an
+   already-resolved, committed lockfile — a bare `Gemfile` with no lock
+   isn't enough, since bundle-audit only reads one, it doesn't generate one.
+6. `*.csproj` / `*.sln` / `*.fsproj` present → `dotnet list package
+   --vulnerable --include-transitive --format json` (needs the `dotnet`
+   SDK — this is a built-in subcommand, no separate tool to install).
+7. None of the above → shown as "no recognized manifest" in the panel.
 
 If the matching tool isn't on `PATH`, that repo shows "not found on PATH"
 instead of a false "clean" result — a missing tool is never silently
 treated as zero vulnerabilities.
 
 No network calls happen outside what each audit tool itself makes (`npm
-audit`, `pip-audit`, and `govulncheck` query their registries/vuln DBs;
-`cargo audit` checks a local RustSec DB clone). The plugin itself doesn't
-talk to any server.
+audit`, `pip-audit`, `govulncheck`, and `dotnet list package --vulnerable`
+query their registries/vuln DBs; `cargo audit` and `bundle-audit` check a
+local advisory-DB clone each downloads on first run). The plugin itself
+doesn't talk to any server.
 
 ## Known limitations
 
@@ -96,17 +105,25 @@ talk to any server.
   resolve a different dependency tree than what's actually installed.
   Native `pnpm audit` / `yarn npm audit` support is a follow-up — their
   JSON shapes differ from npm's and aren't parsed yet.
-- **Severity on pip/go findings**: `pip-audit` and `govulncheck` don't
+- **Severity on pip/go/.NET findings**: `pip-audit` and `govulncheck` don't
   include any severity data in their JSON output (unlike npm's
   critical/high/moderate/low). Their findings are shown as `unknown`
-  severity (amber) rather than a guessed rank. `cargo-audit` findings *do*
-  get a real severity — RustSec advisories often carry a CVSS v3.x vector,
-  which is scored into critical/high/moderate/low the same as npm's; only
-  advisories with no CVSS vector at all (e.g. "unmaintained" notices) fall
-  back to `unknown`.
-- **No CMake/C++ or other build-system support**: only npm, cargo, pip, and
-  Go are covered. There's no single standard audit tool for C/C++
-  dependencies the way the others have one.
+  severity (amber) rather than a guessed rank. `cargo-audit` and
+  `bundle-audit` findings *do* get a real severity — RustSec advisories
+  often carry a CVSS v3.x vector (scored into critical/high/moderate/low
+  the same as npm's), and ruby-advisory-db carries a plain severity
+  (`criticality`) directly; only advisories with neither (e.g.
+  "unmaintained" notices) fall back to `unknown`. `dotnet list package
+  --vulnerable` does report a real severity per finding, same scale, no
+  extra scoring needed.
+- **No fixed-version info from .NET**: unlike every other tool here,
+  `dotnet list package --vulnerable`'s JSON gives no CVE and no target
+  version to upgrade to — just the current version and a GHSA URL. Its fix
+  command re-adds the package without pinning a version (resolves to
+  latest stable) rather than a specific one.
+- **No CMake/C++ or other build-system support**: npm, cargo, pip, Go,
+  Ruby, and .NET are covered. There's no single standard audit tool for
+  C/C++ dependencies the way the others have one.
 
 ## Remove
 

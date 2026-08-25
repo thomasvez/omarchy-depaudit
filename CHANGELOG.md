@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+- Added Ruby support: `Gemfile.lock` → `bundle-audit check --format json`
+  (needs an already-resolved lockfile committed — bundle-audit only reads
+  one, it doesn't run `bundle lock` to generate one). Ruby is the first
+  ecosystem here with real severity built in (`advisory.criticality`), no
+  CVSS math needed like cargo, and its link goes to RubySec's own dedicated
+  advisory page (verified live) rather than `advisory.url`, which has the
+  same "arbitrary external reference" problem cargo's did before 0.4.1.
+- Added .NET support: `*.csproj` / `*.sln` / `*.fsproj` →
+  `dotnet list package --vulnerable --include-transitive --format json`
+  (a built-in dotnet CLI subcommand, not a separate tool to install).
+  Sparser output than every other tool here — no CVE field and no
+  fixed-version info at all, just a GHSA advisory URL — so its fix command
+  is a generic re-add to latest rather than a specific pin.
+- Prepended `~/.dotnet` to the audit script's PATH (same fix as 0.3.0's
+  `~/.cargo/bin` — dotnet-install.sh's common manual-install location isn't
+  on the bar process's session PATH by default either).
+
 ## 0.4.1
 
 - Cargo findings' link now opens RustSec's own advisory page

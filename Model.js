@@ -66,7 +66,7 @@ function markerEcho(index, manager) {
 // freshly-installed audit tool works without requiring a full logout/login
 // — cheap and harmless even when a given directory doesn't exist.
 var PATH_PREFIX = "export PATH=\"$HOME/.cargo/bin:$HOME/go/bin:$HOME/.local/bin:"
-  + "$HOME/.local/share/mise/shims:$PATH\"; "
+  + "$HOME/.local/share/mise/shims:$HOME/.dotnet:$PATH\"; "
 
 function buildAuditScript(projects) {
   var parts = []
@@ -109,6 +109,25 @@ function buildAuditScript(projects) {
       "  " + markerEcho(i, "go") + ";" +
       "  (cd " + qPath + " && govulncheck -scan module -json 2>/dev/null);" +
       " else " + markerEcho(i, "missing:govulncheck") + "; fi;" +
+      // Gemfile.lock, not bare Gemfile: bundle-audit only reads an already-
+      // resolved lockfile, it doesn't generate one — a repo with just a
+      // Gemfile (no committed lock) isn't something we can silently mutate
+      // by running `bundle lock` on the user's behalf.
+      "elif [ -f " + qPath + "/Gemfile.lock ]; then" +
+      " if command -v bundle-audit >/dev/null 2>&1; then" +
+      "  " + markerEcho(i, "ruby") + ";" +
+      "  (cd " + qPath + " && bundle-audit check --format json 2>/dev/null);" +
+      " else " + markerEcho(i, "missing:bundler-audit") + "; fi;" +
+      // No single manifest filename for .NET (*.csproj / *.sln / *.fsproj
+      // all count), so detection is a glob find rather than `[ -f ]`.
+      // `dotnet list package --vulnerable` is a built-in dotnet CLI
+      // subcommand, not a separate installable tool — the "missing tool"
+      // branch here means the `dotnet` SDK itself isn't on PATH.
+      "elif [ -n \"$(find " + qPath + " -maxdepth 1 \\( -name '*.csproj' -o -name '*.sln' -o -name '*.fsproj' \\) -print -quit 2>/dev/null)\" ]; then" +
+      " if command -v dotnet >/dev/null 2>&1; then" +
+      "  " + markerEcho(i, "dotnet") + ";" +
+      "  (cd " + qPath + " && dotnet list package --vulnerable --include-transitive --format json 2>/dev/null);" +
+      " else " + markerEcho(i, "missing:dotnet") + "; fi;" +
       "else " + markerEcho(i, "unknown") + "; fi"
     )
   }
@@ -183,6 +202,8 @@ function parseRepoBlock(label, path, manager, body) {
     if (manager === "npm") findings = parseNpmAudit(json)
     else if (manager === "cargo") findings = parseCargoAudit(json)
     else if (manager === "pip") findings = parsePipAudit(json)
+    else if (manager === "ruby") findings = parseRubyAudit(json)
+    else if (manager === "dotnet") findings = parseDotnetAudit(json)
     else findings = []
   }
 
@@ -471,6 +492,91 @@ function parseGoAudit(rawText) {
   return out
 }
 
+// bundle-audit --format json: {version, created_at, results: [{type, gem:
+// {name, version}, advisory: {id, url, title, cve, ghsa, patched_versions,
+// criticality}}]}. Unlike cargo/pip/go, ruby-advisory-db carries a real
+// severity out of the box — `advisory.criticality` is low/medium/high/
+// critical (verified against a real bundler-audit 0.9.3 run; some
+// advisories have it null, bucketed "unknown" same as elsewhere). `id` is
+// already the advisory's own identifier, a CVE when one was assigned.
+// `patched_versions` are ranges like cargo's `versions.patched`, not exact
+// versions, so the fix command stays a generic `bundle update <gem>`.
+// Result entries can have `type` other than "unpatched_gem" (e.g. an
+// insecure Gemfile source) — those aren't per-package findings in this
+// shape and are skipped rather than guessed at.
+function parseRubyAudit(json) {
+  var out = []
+  var results = (json && Array.isArray(json.results)) ? json.results : []
+  for (var i = 0; i < results.length; i++) {
+    var entry = results[i]
+    if (entry.type !== "unpatched_gem") continue
+    var gem = entry.gem || {}
+    var advisory = entry.advisory || {}
+    var patched = Array.isArray(advisory.patched_versions) ? advisory.patched_versions : []
+    out.push({
+      package: gem.name || "",
+      severity: advisory.criticality ? normalizeSeverity(advisory.criticality) : "unknown",
+      range: gem.version || "",
+      fixedVersion: patched.length > 0 ? patched[0] : null,
+      id: advisory.id || "",
+      title: advisory.title || "",
+      // RubySec's own advisory page (verified live: rubysec.com/advisories/
+      // CVE-2020-8161/ resolves) — advisory.url is, like cargo's, whatever
+      // external reference the advisory author picked (often a mailing-list
+      // thread), not a dedicated finding page.
+      url: advisory.id ? ("https://rubysec.com/advisories/" + advisory.id + "/") : (advisory.url || ""),
+      fixCommand: "bundle update " + (gem.name || "")
+    })
+  }
+  return out
+}
+
+// dotnet list package --vulnerable --include-transitive --format json:
+// {projects: [{path, frameworks: [{framework, topLevelPackages: [...],
+// transitivePackages: [...]}]}]}. Each package entry carries
+// `vulnerabilities: [{severity, advisoryurl}]` (Critical/High/Moderate/Low,
+// capitalized — normalizeSeverity lowercases before matching). Sparser than
+// every other tool here: no CVE field and no fixed-version info at all,
+// just the current version and a GHSA advisory URL, so `id` is the GHSA
+// slug pulled from that URL and the fix command is a generic re-add
+// (`dotnet add package <id>`, which resolves to latest stable) rather than
+// a specific pin. `transitivePackages` is inferred from the CLI's naming
+// convention (parallel to `topLevelPackages`) — not exercised by a live
+// vulnerable-transitive-dependency example in testing, only topLevelPackages
+// was.
+function parseDotnetAudit(json) {
+  var out = []
+  var projects = (json && Array.isArray(json.projects)) ? json.projects : []
+  for (var p = 0; p < projects.length; p++) {
+    var frameworks = Array.isArray(projects[p].frameworks) ? projects[p].frameworks : []
+    for (var f = 0; f < frameworks.length; f++) {
+      var top = Array.isArray(frameworks[f].topLevelPackages) ? frameworks[f].topLevelPackages : []
+      var transitive = Array.isArray(frameworks[f].transitivePackages) ? frameworks[f].transitivePackages : []
+      var packages = top.concat(transitive)
+      for (var g = 0; g < packages.length; g++) {
+        var pkg = packages[g]
+        var vulns = Array.isArray(pkg.vulnerabilities) ? pkg.vulnerabilities : []
+        for (var v = 0; v < vulns.length; v++) {
+          var vuln = vulns[v]
+          var url = vuln.advisoryurl || ""
+          var slug = url.substring(url.lastIndexOf("/") + 1)
+          out.push({
+            package: pkg.id || "",
+            severity: normalizeSeverity(vuln.severity),
+            range: pkg.resolvedVersion || pkg.requestedVersion || "",
+            fixedVersion: null,
+            id: slug,
+            title: "",
+            url: url,
+            fixCommand: "dotnet add package " + (pkg.id || "")
+          })
+        }
+      }
+    }
+  }
+  return out
+}
+
 function normalizeSeverity(value) {
   var s = String(value || "").toLowerCase()
   if (s === "critical" || s === "high" || s === "moderate" || s === "low") return s
@@ -529,6 +635,8 @@ if (typeof module !== "undefined") {
     parsePipAudit: parsePipAudit,
     parseJsonStream: parseJsonStream,
     parseGoAudit: parseGoAudit,
+    parseRubyAudit: parseRubyAudit,
+    parseDotnetAudit: parseDotnetAudit,
     normalizeSeverity: normalizeSeverity,
     aggregate: aggregate,
     badgeLabel: badgeLabel,
