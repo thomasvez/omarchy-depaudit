@@ -1,5 +1,176 @@
 # Changelog
 
+## 0.11.0
+
+- Removed dismiss/ignore: this plugin's job is to surface what your audit
+  tools actually report, not to curate or hide findings — that decision
+  belongs to the person reading the results, not the tool showing them.
+  Removed the "Dismiss"/"Restore" control, the `ignoredMap` state (and its
+  half of `state.json` — only the new-finding baseline is persisted now),
+  and every count/aggregate that used to exclude ignored findings.
+- The project list now appears immediately on open/refresh instead of
+  staying blank (first run) or stale (re-run) while discovery/audit — both
+  potentially slow — are still in flight: a project already scanned keeps
+  its real result on screen, anything newly configured or just discovered
+  shows up right away as "pending" (existing status, previously only used
+  for a truncated-output edge case) until its own result comes in.
+- Made "click a project to see its findings" more visually obvious: the
+  whole row now highlights on hover (same treatment finding rows already
+  use), and the disclosure arrow is bolder and accent-colored on hover —
+  previously just a static gray "›", easy to miss as a click target
+  without already hovering it.
+- 61 tests total (65 → 61): removed the ignore/dismiss tests along with
+  the feature, added one for `buildPendingRepos`.
+
+## 0.10.3
+
+- "unknown" severity findings now show as "no CVSS data" with their own
+  neutral gray, instead of sharing "low"'s yellow. Prompted by a real
+  question: why does a cargo finding show "unknown"? Checked a real repo
+  (RustScan) — every one of its 5 real findings has `"cvss": null`
+  straight from `cargo audit`'s own JSON. That's RustSec genuinely never
+  assigning a severity to that advisory, not a parsing gap (cvssBaseSeverity
+  already scores a vector correctly when one exists — verified earlier
+  against RUSTSEC-2020-0071, matching NVD's 6.2 exactly) — but sharing
+  "low"'s color visually claimed a rating that was never actually made.
+  Applies everywhere severity is shown: the finding tag, the per-repo
+  severity-count row, the detail view's filter chips, and the header's
+  "worst: …" text.
+- 2 new tests (65 total).
+
+## 0.10.2
+
+Audited every ecosystem for the same two bug shapes just found in yarn/.NET
+(duplicate findings, and workspace fragmentation) rather than leaving them
+fixed only where they happened to be reported.
+
+- Fixed the same duplicate-finding shape in .NET: `dotnet list package
+  --vulnerable` at a `.sln` reports results *per project*, so a package
+  several projects in one solution all reference (common in a real
+  multi-project solution) repeated once per project. Proven with a
+  synthetic 2-project solution sharing one vulnerable package (2 findings
+  instead of 1 before this fix). `parseDotnetAudit` now dedupes by
+  package+advisory.
+- Fixed the same workspace-fragmentation shape (as 0.10.0's JS-workspace
+  fix) for Cargo: verified directly against a real cargo workspace that
+  `cargo audit` run inside a member crate directory fails outright
+  ("Couldn't load Cargo.lock" — only the workspace root has one), unlike a
+  genuinely standalone crate with no committed lockfile (cargo generates
+  one on the fly and audits fine — confirmed live). Discovery now drops a
+  Cargo.toml with no Cargo.lock of its own when an ancestor directory has
+  both its own Cargo.toml *and* Cargo.lock, the same rule 0.10.0 added for
+  package.json, generalized to cover both.
+- Checked the remaining ecosystems and left them alone with reasons:
+  npm/pnpm's audit JSON is already keyed by package/advisory id (can't
+  structurally duplicate); pip/Go/Ruby resolve to one locked version per
+  dependency with no shared-lockfile "workspace" concept in mainstream use
+  (nothing to fragment or duplicate).
+- 2 new tests (63 total).
+
+## 0.10.1
+
+- Fixed a real bug the new detail view (0.10.0) made visible: the same
+  finding showing up dozens of times in a row. `yarn audit --json` emits
+  one `auditAdvisory` event per dependency *path* that reaches a
+  vulnerable package, not per distinct vulnerability — in a large
+  workspace where many members pull in the same package, that's one event
+  per member. Found live in a real repo where a single `tar` advisory
+  alone accounted for well over 100 of a 3301-finding total.
+  `parseYarnAudit` now dedupes by `advisory.id` (yarn's own stable id for
+  the advisory record, distinct from the per-occurrence `resolution.id`) —
+  verified against a fresh real audit of the same repo: 3301 → 314 real
+  distinct findings. Two genuinely different advisories for the same
+  package (this file's own `minimist` fixture, two separate real CVEs)
+  are unaffected — still both reported.
+- 1 new test (61 total).
+
+## 0.10.0
+
+- Clicking a repo now opens its findings in a dedicated, wider detail view
+  (panel widens from 600px to 860px while it's open) instead of expanding
+  the list inline. A repo with a lot of findings made the inline expand
+  genuinely slow — every finding's row got built at once, reflowing the
+  whole popup's height — found via a real yarn workspace with 3000+
+  findings in one repo (see below) that made the panel visibly stutter.
+  The detail view adds:
+  - Severity filter chips (all/critical/high/moderate/low/unknown), each
+    labeled with how many of the repo's findings match.
+  - Pagination, 20 findings per page — caps how many finding rows exist at
+    once regardless of the repo's real total, which is what actually fixes
+    the slowness (verified live against a real 3301-finding repo: chips
+    and page rendered promptly, only 20 rows ever mounted).
+  - "‹ Back" (or Escape) returns to the repo list; the rescan glyph now
+    lives in the detail view's header instead of the list row.
+- Added a way to scan discoverRoots for new projects without re-auditing
+  everything already known: a 🔎 button next to the settings gear (only
+  shown when discoverRoots is configured) re-runs discovery and audits
+  only the projects not already in the list, leaving existing repos'
+  results untouched. `refresh()` (timer/manual) still re-checks every
+  configured project as before — this is for "did I just clone something
+  new" without paying for a full re-audit.
+- Fixed a real discovery bug, found live via a freshly-cloned yarn
+  workspace (Backstage-style: root package.json+yarn.lock declaring
+  `workspaces: ["packages/*", "plugins/*"]`): workspace members
+  (packages/app, packages/backend — no lockfile of their own) each
+  discovered as their own bogus "project", fell back to a broken plain
+  `npm audit` (no package-lock.json to audit against), and reported no
+  results — "many entries, no results". `parseDiscoveredProjects` now
+  drops a lockfile-less package.json when an ancestor directory has both
+  its own package.json *and* a lockfile — that ancestor's audit already
+  covers it. The same rule also correctly drops non-workspace
+  scaffold/template package.json files nested under a real project root
+  (found in the same repo: a Backstage software-template placeholder with
+  `"name": "${{ values.name }}"` and no real dependencies). A package.json
+  dir that has its own lockfile is never dropped by this rule.
+- Fixed a matching regression in 0.9.1's maxdepth 3→5 change, found live
+  against a real 6-project .NET solution: a `.csproj`/`.fsproj` nested
+  under a directory with its own `.sln` now gets dropped the same way — a
+  `.sln`'s `dotnet list package --vulnerable --include-transitive` already
+  resolves everything it references, so the solution no longer fragments
+  into one bogus "project" per nested `.csproj`.
+- 6 new tests (60 total): the two discovery fixes above, plus the detail
+  view's filter/pagination helpers (`Model.filterFindings`,
+  `Model.countAllBySeverity`, `Model.paginateFindings`).
+
+## 0.9.2
+
+- Added a way to scan discoverRoots for new projects without re-auditing
+  everything already known: a 🔎 button next to the settings gear (only
+  shown when discoverRoots is configured) re-runs discovery and audits
+  only the projects not already in the list, leaving existing repos'
+  results and expand/collapse state untouched. `refresh()` (timer/manual)
+  still re-checks every configured project as before — this is for "did I
+  just clone something new" without paying for a full re-audit.
+- Fixed a real regression from 0.9.1's maxdepth 3→5 change, found while
+  verifying the above live against a real repo: discovery now also
+  matches `.csproj`/`.fsproj` files nested several levels under a
+  directory that already has its own `.sln` — before this fix, a real
+  6-project .NET solution (root `MockServer.API.sln` plus a `.csproj` per
+  project under `src/`) fragmented into 7 redundant "projects" instead of
+  the 1 the solution actually represents, since `dotnet list package
+  --vulnerable --include-transitive` at the `.sln`'s own directory already
+  resolves everything it references. `parseDiscoveredProjects` now drops
+  a `.csproj`/`.fsproj` match nested under a directory with its own
+  `.sln`; every other manifest type (including a legitimately nested
+  Cargo.toml or package.json in a monorepo) is unaffected.
+- 2 new tests (54 total).
+
+## 0.9.1
+
+- Fixed a real discovery bug found via user report (a cloned .NET project
+  wasn't detected): `discoverRoots`' walk used `-maxdepth 3`, too shallow
+  for the common .NET layout `RepoRoot/src/ProjectName/ProjectName.csproj`,
+  which sits 4 levels below a discoverRoot that's the *parent* of RepoRoot
+  — one past where 3 would still look. The reported repo happened to also
+  have a root `.sln` at depth 2, so it wasn't actually missed by that rule
+  alone; the real cause was that it simply hadn't been scanned yet since
+  being cloned (confirmed via `state.json`'s baseline, fixed by a manual
+  refresh). But the shallow maxdepth was a genuine latent bug for any
+  same-shaped repo with no root `.sln`/`.csproj` — only the nested project
+  file — which would have been silently skipped. Bumped to `-maxdepth 5`.
+- 1 new test (53 total): a synthetic repo with only a deeply-nested
+  `.csproj` and no shallow manifest to accidentally save it.
+
 ## 0.9.0
 
 - Supported ecosystems are now visible in the plugin itself, not just the

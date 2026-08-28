@@ -217,6 +217,32 @@ function parseAuditOutput(raw, projects) {
   return results
 }
 
+// Builds the list to show *while* a scan is in flight: a project already
+// present in existingRepos (by path) keeps its most recent real result;
+// anything newly configured/discovered that hasn't been scanned yet gets
+// the same "pending" placeholder parseAuditOutput itself falls back to
+// for a project whose marker never showed up in the script's output. Lets
+// the project list appear immediately on open/refresh instead of staying
+// blank (first run) or stale (re-run) until the whole — possibly slow —
+// audit script finishes.
+function buildPendingRepos(projects, existingRepos) {
+  var byPath = {}
+  for (var i = 0; i < existingRepos.length; i++) byPath[existingRepos[i].path] = existingRepos[i]
+  var out = []
+  for (var j = 0; j < projects.length; j++) {
+    var p = projects[j]
+    out.push(byPath[p.path] || {
+      label: plainText(p.label || p.path || ""),
+      path: String(p.path || ""),
+      manager: "pending",
+      status: "pending",
+      findings: [],
+      worstSeverity: "none"
+    })
+  }
+  return out
+}
+
 function parseRepoBlock(label, path, manager, body) {
   var base = { label: plainText(label), path: path, manager: manager }
 
@@ -368,6 +394,7 @@ function parsePnpmAudit(json) {
 // `yarn upgrade <pkg>` fix command as pnpm/cargo.
 function parseYarnAudit(rawText) {
   var out = []
+  var seenAdvisoryIds = {}
   var lines = String(rawText || "").split("\n")
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim()
@@ -376,6 +403,24 @@ function parseYarnAudit(rawText) {
     try { obj = JSON.parse(line) } catch (e) { continue }
     if (obj.type !== "auditAdvisory") continue
     var a = (obj.data && obj.data.advisory) || {}
+    // yarn classic emits one auditAdvisory event per dependency PATH that
+    // reaches the vulnerable package, not per distinct vulnerability — in
+    // a large workspace where many members depend (transitively) on the
+    // same package, the exact same advisory repeats once per path. Found
+    // live in a real ~3000-finding repo: a single `tar` CVE alone showed
+    // up dozens of times in a row, identical severity/version/fix, because
+    // that many workspace members happened to pull it in. advisory.id is
+    // yarn's own stable numeric id for the underlying advisory record
+    // (distinct from `resolution.id`/path, which does vary per
+    // occurrence), so it's the right dedup key — two genuinely different
+    // advisories for the same package (this file's own fixture: minimist
+    // has two separate real CVEs, ids 1096466 and 1097677) keep distinct
+    // ids and both still get reported.
+    var advisoryId = a.id
+    if (advisoryId !== undefined && advisoryId !== null) {
+      if (seenAdvisoryIds[advisoryId]) continue
+      seenAdvisoryIds[advisoryId] = true
+    }
     var findingRows = Array.isArray(a.findings) ? a.findings : []
     var version = findingRows.length > 0 ? findingRows[0].version : ""
     out.push({
@@ -662,6 +707,7 @@ function parseRubyAudit(json) {
 // was.
 function parseDotnetAudit(json) {
   var out = []
+  var seenPackageAdvisory = {}
   var projects = (json && Array.isArray(json.projects)) ? json.projects : []
   for (var p = 0; p < projects.length; p++) {
     var frameworks = Array.isArray(projects[p].frameworks) ? projects[p].frameworks : []
@@ -676,6 +722,20 @@ function parseDotnetAudit(json) {
           var vuln = vulns[v]
           var url = vuln.advisoryurl || ""
           var slug = url.substring(url.lastIndexOf("/") + 1)
+          // `dotnet list package --vulnerable` at a .sln reports results
+          // PER PROJECT the solution contains — the same shared transitive
+          // package (very common in a real multi-project solution: several
+          // projects all referencing the same logging/serialization
+          // package) repeats once per project that references it. Same
+          // duplication shape as yarn classic's per-path repeats (see
+          // parseYarnAudit) — proven with a synthetic 2-project solution
+          // sharing one vulnerable package before this fix (2 findings
+          // instead of 1). Dedupe key is package+advisory since dotnet's
+          // JSON carries no separate stable advisory id the way yarn's
+          // does.
+          var dedupeKey = (pkg.id || "") + "|" + slug
+          if (seenPackageAdvisory[dedupeKey]) continue
+          seenPackageAdvisory[dedupeKey] = true
           out.push({
             package: pkg.id || "",
             severity: normalizeSeverity(vuln.severity),
@@ -700,37 +760,60 @@ function normalizeSeverity(value) {
   return "unknown"
 }
 
-// Worst severity across every repo, for the bar badge. Ignored findings
-// (see markIgnored) don't count toward the total — dismissing a finding is
-// supposed to quiet the badge, not just gray it out in the panel — but a
-// finding with no `ignored` field at all (every caller before ignore
-// support existed, and every test fixture) is treated as not ignored, so
-// this stays backward compatible.
+// Worst severity across every repo, for the bar badge.
 function aggregate(repos) {
   var total = 0
   var worst = "none"
   for (var i = 0; i < repos.length; i++) {
     var findings = repos[i].findings || []
-    for (var j = 0; j < findings.length; j++) {
-      if (findings[j].ignored !== true) total++
-    }
+    total += findings.length
     if (SEVERITY_RANK[repos[i].worstSeverity] > SEVERITY_RANK[worst]) worst = repos[i].worstSeverity
   }
   return { total: total, worstSeverity: worst }
 }
 
-// Per-severity finding count for one repo — the collapsed-section summary
-// (e.g. "2 critical  1 high") so a project doesn't need to be expanded just
-// to see whether it's a problem. Ignored findings are excluded, same
-// reasoning as aggregate().
+// Per-severity finding count — the collapsed-section summary (e.g.
+// "2 critical  1 high") so a project doesn't need to be opened just to see
+// whether it's a problem, and the detail view's filter chip counts.
 function countBySeverity(findings) {
   var counts = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 }
   for (var i = 0; i < findings.length; i++) {
-    if (findings[i].ignored === true) continue
     var s = findings[i].severity
     if (counts[s] !== undefined) counts[s]++
   }
   return counts
+}
+
+// Every severity a repo's detail view can be filtered to, in display order
+// — "all" first, then worst to least severe.
+var SEVERITY_FILTERS = ["all", "critical", "high", "moderate", "low", "unknown"]
+
+// Findings for one repo's detail view, filtered to a single severity —
+// "all"/empty returns every finding unfiltered.
+function filterFindings(findings, severity) {
+  if (!severity || severity === "all") return findings.slice()
+  var out = []
+  for (var i = 0; i < findings.length; i++) {
+    if (findings[i].severity === severity) out.push(findings[i])
+  }
+  return out
+}
+
+// Slices an already-filtered findings list into one page. Clamps the
+// requested page into range so switching to a smaller filter (fewer pages)
+// while sitting on a now out-of-range page returns the last valid page
+// instead of an empty one.
+function paginateFindings(findings, page, pageSize) {
+  var size = Math.max(1, pageSize | 0)
+  var pageCount = Math.max(1, Math.ceil(findings.length / size))
+  var p = Math.min(Math.max(0, page | 0), pageCount - 1)
+  var start = p * size
+  return {
+    items: findings.slice(start, start + size),
+    page: p,
+    pageCount: pageCount,
+    total: findings.length
+  }
 }
 
 // ---- In-panel settings form -------------------------------------------
@@ -786,59 +869,6 @@ function parseRootsText(text) {
 
 function rootsToText(roots) {
   return (roots || []).join("\n")
-}
-
-// ---- Ignore/dismiss a finding ---------------------------------------------
-//
-// Keyed by "<repoPath>|<findingId>" rather than just the finding id: the
-// same CVE can be a direct, must-fix dependency in one repo and an
-// irrelevant dev-only transitive one in another, so dismissing it should be
-// scoped per-repo, not global.
-
-function ignoreKey(path, id) {
-  return String(path || "") + "|" + String(id || "")
-}
-
-function isIgnored(ignoredMap, path, id) {
-  return !!(ignoredMap && ignoredMap[ignoreKey(path, id)])
-}
-
-function toggleIgnored(ignoredMap, path, id) {
-  var next = {}
-  for (var k in ignoredMap) next[k] = ignoredMap[k]
-  var key = ignoreKey(path, id)
-  if (next[key]) delete next[key]
-  else next[key] = true
-  return next
-}
-
-// Annotates every finding with `ignored` per the ignored-map and
-// recomputes each repo's `worstSeverity` from only the non-ignored ones —
-// an ignored critical shouldn't keep coloring a collapsed section's dot
-// red. Findings stay in the list either way (ignored or not): dismissing
-// one is meant to be reversible and visible, not a silent delete.
-function markIgnored(repos, ignoredMap) {
-  var out = []
-  for (var i = 0; i < repos.length; i++) {
-    var repo = repos[i]
-    var findings = (repo.findings || []).map(function(f) {
-      var copy = {}
-      for (var k in f) copy[k] = f[k]
-      copy.ignored = isIgnored(ignoredMap, repo.path, f.id)
-      return copy
-    })
-    var worst = "none"
-    for (var j = 0; j < findings.length; j++) {
-      if (findings[j].ignored) continue
-      if (SEVERITY_RANK[findings[j].severity] > SEVERITY_RANK[worst]) worst = findings[j].severity
-    }
-    var repoCopy = {}
-    for (var rk in repo) repoCopy[rk] = repo[rk]
-    repoCopy.findings = findings
-    repoCopy.worstSeverity = worst
-    out.push(repoCopy)
-  }
-  return out
 }
 
 // ---- New-since-last-scan detection (for proactive notifications) ---------
@@ -913,6 +943,15 @@ function newFindingsSummary(newFindings) {
 // root can't be interpreted — quoting and `~`-expansion are mutually
 // exclusive, so this makes the same tradeoff `projects[].path` already
 // makes).
+//
+// -maxdepth 5: verified against a real clone that a shallower limit (3)
+// misses in practice — a .NET repo laid out as the common
+// `RepoRoot/src/ProjectName/ProjectName.csproj` sits 4 levels below a
+// discoverRoot that's the *parent* of RepoRoot (e.g. ~/Development), one
+// past where 3 would still look. That specific repo happened to also carry
+// a root .sln (depth 2) so it wasn't actually missed, but a same-shaped
+// repo with no root .sln/.csproj — only the nested project files — would
+// have been silently skipped.
 function buildDiscoveryScript(roots) {
   var parts = []
   for (var i = 0; i < roots.length; i++) {
@@ -920,37 +959,131 @@ function buildDiscoveryScript(roots) {
     if (root === "") continue
     var qRoot = shellQuote(root)
     parts.push(
-      "find " + qRoot + " -maxdepth 3 " +
+      "find " + qRoot + " -maxdepth 5 " +
       "\\( -name node_modules -o -name .git -o -name target -o -name vendor " +
       "-o -name .venv -o -name venv -o -name bin -o -name obj -o -name build \\) -prune -o " +
       "\\( -name Cargo.toml -o -name package.json -o -name requirements.txt " +
       "-o -name pyproject.toml -o -name go.mod -o -name Gemfile.lock " +
-      "-o -name '*.csproj' -o -name '*.sln' -o -name '*.fsproj' \\) -print 2>/dev/null"
+      "-o -name '*.csproj' -o -name '*.sln' -o -name '*.fsproj' " +
+      "-o -name package-lock.json -o -name yarn.lock -o -name pnpm-lock.yaml " +
+      "-o -name npm-shrinkwrap.json -o -name Cargo.lock \\) -print 2>/dev/null"
     )
   }
   return parts.join("; ")
 }
 
-// Turns buildDiscoveryScript's output (one manifest file path per line)
+// Turns buildDiscoveryScript's output (one manifest/lockfile path per line)
 // into {label, path} project entries — one per containing directory, deduped
 // (a repo can trip more than one manifest pattern, e.g. a workspace with
 // both a root package.json and a nested Cargo.toml would otherwise still
 // only collapse duplicates of the *same* directory, not merge distinct
 // sub-projects, which is the intended behavior for a monorepo-style tree).
+//
+// Two deliberate exceptions, both "umbrella manifest already covers this"
+// cases found via real repos:
+//
+// 1. A *.csproj/*.fsproj nested under a directory that has its own .sln is
+//    dropped, not kept as its own project (root MockServer.API.sln, plus a
+//    .csproj under src/MockServer.API/, src/MockServer.Data/, etc.) —
+//    buildAuditScript's .NET branch runs `dotnet list package --vulnerable
+//    --include-transitive` at the matched directory, and at the .sln's own
+//    directory that already resolves every project the solution
+//    references. Only .sln gets this treatment — a bare .csproj nested
+//    under another bare .csproj is left alone, since (unlike .sln) there's
+//    no general way to tell from discovery alone whether one references
+//    the other.
+//
+// 2. A "coverable" manifest (package.json or Cargo.toml) with no lockfile
+//    of its own is dropped when an ancestor directory has both the SAME
+//    manifest filename *and* a matching lockfile — e.g. package.json is
+//    covered by an ancestor package.json+(package-lock.json/yarn.lock/
+//    pnpm-lock.yaml/npm-shrinkwrap.json), Cargo.toml by an ancestor
+//    Cargo.toml+Cargo.lock. Matching by manifest type keeps the two
+//    ecosystems from cross-covering each other.
+//
+//    package.json: found via a real yarn workspace (Backstage-style: root
+//    package.json+yarn.lock declaring `workspaces: ["packages/*",
+//    "plugins/*"]`). Workspace members like packages/app and
+//    packages/backend have no lockfile of their own (they resolve through
+//    the root's), so without this they fell back to buildAuditScript's
+//    plain `npm audit` branch — which runs regardless of whether a
+//    package-lock.json actually exists, producing no real results — while
+//    the repo also fragmented into one bogus "project" per member. The
+//    same rule also correctly drops non-workspace scaffold/template
+//    package.json files nested anywhere under a real project root (found
+//    in the same repo: examples/template/content/package.json, a Backstage
+//    software-template placeholder with `"name": "${{ values.name }}"` and
+//    no real dependencies) — not because it's a workspace member, but
+//    because it likewise has no lockfile of its own and isn't
+//    independently auditable either way.
+//
+//    Cargo.toml: found by testing a real cargo workspace directly —
+//    `cargo audit` run inside a workspace member directory (which has no
+//    Cargo.lock of its own; only the workspace root does) fails outright
+//    ("error: not found: Couldn't load Cargo.lock") rather than falling
+//    back to anything, unlike a genuinely standalone crate with no
+//    committed lockfile at all (verified separately: cargo auto-generates
+//    one on the fly and audits fine) — it's specifically being *inside a
+//    workspace* that breaks it. A manifest dir that DOES have its own
+//    matching lockfile is never dropped by this rule — that's a genuinely
+//    independent, already-resolved project.
+var COVERABLE_MANIFEST_LOCKFILES = {
+  "package.json": { "package-lock.json": true, "yarn.lock": true, "pnpm-lock.yaml": true, "npm-shrinkwrap.json": true },
+  "Cargo.toml": { "Cargo.lock": true }
+}
 function parseDiscoveredProjects(rawText) {
   var lines = String(rawText || "").split("\n")
   var seen = {}
-  var out = []
+  var dirs = []
+  var slnDirs = []
+  var lockfileDirs = {}
+  var manifestDirsByType = {}
+  var allLockfileNames = {}
+  for (var manifestName in COVERABLE_MANIFEST_LOCKFILES) {
+    manifestDirsByType[manifestName] = {}
+    for (var lockName in COVERABLE_MANIFEST_LOCKFILES[manifestName]) allLockfileNames[lockName] = true
+  }
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].trim()
     if (line === "") continue
     var slash = line.lastIndexOf("/")
     var dir = slash === -1 ? line : line.substring(0, slash)
-    if (dir === "" || seen[dir]) continue
+    var filename = slash === -1 ? line : line.substring(slash + 1)
+    if (dir === "") continue
+    if (allLockfileNames[filename]) { lockfileDirs[dir] = true; continue }
+    if (manifestDirsByType[filename]) manifestDirsByType[filename][dir] = true
+    if (/\.sln$/.test(filename) && slnDirs.indexOf(dir) === -1) slnDirs.push(dir)
+    if (seen[dir]) continue
     seen[dir] = true
-    var labelSlash = dir.lastIndexOf("/")
-    var label = labelSlash === -1 ? dir : dir.substring(labelSlash + 1)
-    out.push({ label: label || dir, path: dir })
+    dirs.push(dir)
+  }
+  function isNestedUnder(dir, ancestor) {
+    return dir !== ancestor && dir.indexOf(ancestor + "/") === 0
+  }
+  var out = []
+  for (var j = 0; j < dirs.length; j++) {
+    var d = dirs[j]
+    var coveredBySln = false
+    for (var k = 0; k < slnDirs.length; k++) {
+      if (isNestedUnder(d, slnDirs[k])) { coveredBySln = true; break }
+    }
+    if (coveredBySln) continue
+    var coveredByLockfileAncestor = false
+    for (var manifestName in COVERABLE_MANIFEST_LOCKFILES) {
+      if (!manifestDirsByType[manifestName][d] || lockfileDirs[d]) continue
+      for (var m = 0; m < dirs.length; m++) {
+        var a = dirs[m]
+        if (a !== d && manifestDirsByType[manifestName][a] && lockfileDirs[a] && isNestedUnder(d, a)) {
+          coveredByLockfileAncestor = true
+          break
+        }
+      }
+      if (coveredByLockfileAncestor) break
+    }
+    if (coveredByLockfileAncestor) continue
+    var labelSlash = d.lastIndexOf("/")
+    var label = labelSlash === -1 ? d : d.substring(labelSlash + 1)
+    out.push({ label: label || d, path: d })
   }
   return out
 }
@@ -986,11 +1119,27 @@ function badgeLabel(total) {
 // Universal red/amber meaning — deliberately not drawn from the active
 // theme's accent, since severity color-coding needs to mean the same thing
 // across every theme. `null` defers to the bar's normal foreground.
+// "unknown" gets its own neutral gray, distinct from "low"'s yellow — it
+// means the advisory source never assigned a severity at all (verified
+// against a real cargo-audit run: RustSec advisories frequently carry no
+// CVSS vector — RUSTSEC-2026-0204/0098/0099 in a real repo all had
+// `cvss: null`), not "this was rated low risk". Sharing low's color would
+// visually claim a rating that was never actually made.
 function severityColor(severity) {
   if (severity === "critical" || severity === "high") return "#e05252"
   if (severity === "moderate") return "#e0a83f"
-  if (severity === "low" || severity === "unknown") return "#c9b458"
+  if (severity === "low") return "#c9b458"
+  if (severity === "unknown") return "#8a8f98"
   return null
+}
+
+// Human-facing label for a severity — every value passes through
+// unchanged except "unknown", which reads as "no CVSS data" instead. Kept
+// separate from the raw severity string (used as-is for SEVERITY_RANK,
+// countBySeverity's object keys, filtering, etc.) so nothing outside
+// display code needs to know about the friendlier wording.
+function severityLabel(severity) {
+  return severity === "unknown" ? "no CVSS data" : severity
 }
 
 // Right-click summary sent as a desktop notification, so the count is
@@ -1013,6 +1162,7 @@ if (typeof module !== "undefined") {
     supportedEcosystemsText: supportedEcosystemsText,
     buildAuditScript: buildAuditScript,
     parseAuditOutput: parseAuditOutput,
+    buildPendingRepos: buildPendingRepos,
     parseNpmAudit: parseNpmAudit,
     parsePnpmAudit: parsePnpmAudit,
     parseYarnAudit: parseYarnAudit,
@@ -1026,14 +1176,13 @@ if (typeof module !== "undefined") {
     normalizeSeverity: normalizeSeverity,
     aggregate: aggregate,
     countBySeverity: countBySeverity,
+    filterFindings: filterFindings,
+    paginateFindings: paginateFindings,
+    SEVERITY_FILTERS: SEVERITY_FILTERS,
     parseProjectsText: parseProjectsText,
     projectsToText: projectsToText,
     parseRootsText: parseRootsText,
     rootsToText: rootsToText,
-    ignoreKey: ignoreKey,
-    isIgnored: isIgnored,
-    toggleIgnored: toggleIgnored,
-    markIgnored: markIgnored,
     computeNewFindings: computeNewFindings,
     newFindingsSummary: newFindingsSummary,
     buildDiscoveryScript: buildDiscoveryScript,
@@ -1041,6 +1190,7 @@ if (typeof module !== "undefined") {
     mergeProjects: mergeProjects,
     badgeLabel: badgeLabel,
     severityColor: severityColor,
+    severityLabel: severityLabel,
     notificationSummary: notificationSummary
   }
 }

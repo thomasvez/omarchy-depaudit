@@ -107,6 +107,18 @@ test("severityColor returns a color for known severities, null for none", () => 
   assert.equal(Model.severityColor("none"), null)
 })
 
+test("severityColor gives 'unknown' its own color, distinct from 'low'", () => {
+  assert.notEqual(Model.severityColor("unknown"), Model.severityColor("low"))
+})
+
+test("severityLabel reads 'unknown' as 'no CVSS data', passes everything else through unchanged", () => {
+  assert.equal(Model.severityLabel("unknown"), "no CVSS data")
+  assert.equal(Model.severityLabel("critical"), "critical")
+  assert.equal(Model.severityLabel("high"), "high")
+  assert.equal(Model.severityLabel("moderate"), "moderate")
+  assert.equal(Model.severityLabel("low"), "low")
+})
+
 test("badgeLabel is empty for zero findings, the count otherwise", () => {
   assert.equal(Model.badgeLabel(0), "")
   assert.equal(Model.badgeLabel(5), "5")
@@ -227,6 +239,43 @@ test("parseYarnAudit ignores non-auditAdvisory lines (auditSummary, etc.)", () =
   assert.deepEqual(Model.parseYarnAudit(stream), [])
 })
 
+test("parseYarnAudit dedupes the same advisory reached via many dependency paths", () => {
+  // Regression test for a real ~3000-finding workspace where the same
+  // `tar` advisory repeated once per workspace member that pulled it in —
+  // yarn classic emits one auditAdvisory event per dependency *path*, not
+  // per distinct vulnerability. Same advisory.id (999), three different
+  // resolution paths/ids, one genuinely different advisory (1000) mixed
+  // in to confirm it isn't also collapsed.
+  function advisoryLine(advisoryId, resolutionId, path, moduleName) {
+    return JSON.stringify({
+      type: "auditAdvisory",
+      data: {
+        resolution: { id: resolutionId, path: path },
+        advisory: {
+          id: advisoryId,
+          module_name: moduleName,
+          severity: "critical",
+          cves: ["CVE-2026-59873"],
+          github_advisory_id: "GHSA-xxxx",
+          findings: [{ version: "6.2.1", paths: [path] }],
+          patched_versions: ">=7.5.19",
+          title: "node-tar: Decompression/parse DoS",
+          url: "https://github.com/advisories/GHSA-xxxx"
+        }
+      }
+    })
+  }
+  const stream = [
+    advisoryLine(999, 1, "packages/app > tar", "tar"),
+    advisoryLine(999, 2, "packages/backend > tar", "tar"),
+    advisoryLine(999, 3, "plugins/foo > some-dep > tar", "tar"),
+    advisoryLine(1000, 4, "packages/app > brace-expansion", "brace-expansion")
+  ].join("\n")
+  const findings = Model.parseYarnAudit(stream)
+  assert.equal(findings.length, 2)
+  assert.deepEqual(findings.map(f => f.package).sort(), ["brace-expansion", "tar"])
+})
+
 test("parseCargoAudit: scores CVSS into a real severity and links to RustSec", () => {
   const findings = Model.parseCargoAudit(fixtureJson("cargo-audit.json"))
   assert.equal(findings.length, 1)
@@ -282,6 +331,35 @@ test("parseDotnetAudit: reads topLevelPackages, GHSA-slug id, generic re-add fix
   assert.equal(f.fixCommand, "dotnet add package System.Text.Encodings.Web")
 })
 
+test("parseDotnetAudit dedupes the same vulnerable package shared across multiple projects in one solution", () => {
+  // Regression test for the same duplication shape as parseYarnAudit's
+  // fix: `dotnet list package --vulnerable` at a .sln reports results per
+  // PROJECT, so a package several projects all reference transitively
+  // (common in a real multi-project solution) repeated once per project.
+  const json = {
+    projects: [
+      { path: "A.csproj", frameworks: [{ framework: "net8.0", topLevelPackages: [], transitivePackages: [
+        { id: "System.Text.Json", resolvedVersion: "8.0.0", vulnerabilities: [
+          { severity: "High", advisoryurl: "https://github.com/advisories/GHSA-hh2w-p6rv-4g7w" }
+        ] }
+      ] }] },
+      { path: "B.csproj", frameworks: [{ framework: "net8.0", topLevelPackages: [], transitivePackages: [
+        { id: "System.Text.Json", resolvedVersion: "8.0.0", vulnerabilities: [
+          { severity: "High", advisoryurl: "https://github.com/advisories/GHSA-hh2w-p6rv-4g7w" }
+        ] }
+      ] }] },
+      { path: "C.csproj", frameworks: [{ framework: "net8.0", topLevelPackages: [
+        { id: "SomeOtherPkg", resolvedVersion: "1.0.0", vulnerabilities: [
+          { severity: "Moderate", advisoryurl: "https://github.com/advisories/GHSA-other" }
+        ] }
+      ], transitivePackages: [] }] }
+    ]
+  }
+  const findings = Model.parseDotnetAudit(json)
+  assert.equal(findings.length, 2)
+  assert.deepEqual(findings.map(f => f.package).sort(), ["SomeOtherPkg", "System.Text.Json"])
+})
+
 // ---- parseAuditOutput end-to-end (marker splitting, index-keyed matching) --
 
 test("parseAuditOutput routes each marked chunk to the right parser by manager tag", () => {
@@ -329,6 +407,22 @@ test("parseAuditOutput: a project with no matching chunk stays pending", () => {
   assert.equal(repos[0].status, "pending")
 })
 
+test("buildPendingRepos keeps existing results, placeholders anything not yet scanned", () => {
+  const existing = [
+    { label: "known", path: "/x/known", manager: "npm", status: "ok", findings: [{ id: "CVE-1" }], worstSeverity: "high" }
+  ]
+  const projects = [
+    { label: "known", path: "/x/known" },
+    { label: "brand new", path: "/x/new" }
+  ]
+  const result = Model.buildPendingRepos(projects, existing)
+  assert.equal(result.length, 2)
+  assert.equal(result[0], existing[0], "already-scanned repo is reused as-is, not rebuilt")
+  assert.equal(result[1].status, "pending")
+  assert.equal(result[1].label, "brand new")
+  assert.equal(result[1].path, "/x/new")
+})
+
 // ---- Integration: buildAuditScript output actually runs in bash ----------
 //
 // Doesn't require any of the six audit tools to be installed — the paths
@@ -373,29 +467,7 @@ test("defaultProjects is an empty array", () => {
   assert.deepEqual(Model.defaultProjects(), [])
 })
 
-// ---- Ignore/dismiss --------------------------------------------------
-
-test("ignoreKey scopes by repo path, not just finding id", () => {
-  assert.notEqual(Model.ignoreKey("/repo/a", "CVE-1"), Model.ignoreKey("/repo/b", "CVE-1"))
-})
-
-test("toggleIgnored flips membership without mutating the input map", () => {
-  const original = {}
-  const once = Model.toggleIgnored(original, "/repo/a", "CVE-1")
-  assert.equal(Model.isIgnored(once, "/repo/a", "CVE-1"), true)
-  assert.deepEqual(original, {}, "input map must not be mutated in place")
-
-  const twice = Model.toggleIgnored(once, "/repo/a", "CVE-1")
-  assert.equal(Model.isIgnored(twice, "/repo/a", "CVE-1"), false)
-})
-
-test("toggleIgnored scopes to the exact repo — ignoring in one repo leaves another untouched", () => {
-  const map = Model.toggleIgnored({}, "/repo/a", "CVE-1")
-  assert.equal(Model.isIgnored(map, "/repo/a", "CVE-1"), true)
-  assert.equal(Model.isIgnored(map, "/repo/b", "CVE-1"), false)
-})
-
-test("markIgnored annotates findings and drops ignored ones from worstSeverity", () => {
+test("aggregate/countBySeverity total every finding across repos", () => {
   const repos = [{
     path: "/repo/a",
     findings: [
@@ -404,27 +476,47 @@ test("markIgnored annotates findings and drops ignored ones from worstSeverity",
     ],
     worstSeverity: "critical"
   }]
-  const ignoredMap = Model.toggleIgnored({}, "/repo/a", "CVE-1")
-  const [marked] = Model.markIgnored(repos, ignoredMap)
-
-  assert.equal(marked.findings.find(f => f.id === "CVE-1").ignored, true)
-  assert.equal(marked.findings.find(f => f.id === "CVE-2").ignored, false)
-  assert.equal(marked.findings.length, 2, "ignored findings stay in the list, not deleted")
-  assert.equal(marked.worstSeverity, "low", "worst severity now reflects only the non-ignored finding")
+  assert.deepEqual(Model.aggregate(repos), { total: 2, worstSeverity: "critical" })
+  assert.deepEqual(Model.countBySeverity(repos[0].findings), { critical: 1, high: 0, moderate: 0, low: 1, unknown: 0 })
 })
 
-test("aggregate/countBySeverity exclude ignored findings from totals", () => {
-  const repos = [{
-    path: "/repo/a",
-    findings: [
-      { id: "CVE-1", severity: "critical" },
-      { id: "CVE-2", severity: "low" }
-    ],
-    worstSeverity: "critical"
-  }]
-  const [marked] = Model.markIgnored(repos, Model.toggleIgnored({}, "/repo/a", "CVE-1"))
-  assert.deepEqual(Model.aggregate([marked]), { total: 1, worstSeverity: "low" })
-  assert.deepEqual(Model.countBySeverity(marked.findings), { critical: 0, high: 0, moderate: 0, low: 1, unknown: 0 })
+// ---- Repo detail view: severity filter + pagination -----------------------
+
+test("filterFindings: 'all' returns everything, a severity keeps only matches", () => {
+  const findings = [
+    { id: "CVE-1", severity: "critical" },
+    { id: "CVE-2", severity: "high" },
+    { id: "CVE-3", severity: "critical" }
+  ]
+  assert.equal(Model.filterFindings(findings, "all").length, 3)
+  assert.equal(Model.filterFindings(findings, "").length, 3)
+  const critical = Model.filterFindings(findings, "critical")
+  assert.deepEqual(critical.map(f => f.id), ["CVE-1", "CVE-3"])
+})
+
+test("paginateFindings slices by page and reports pageCount/total", () => {
+  const findings = Array.from({ length: 45 }, (_, i) => ({ id: "CVE-" + i }))
+  const first = Model.paginateFindings(findings, 0, 20)
+  assert.equal(first.items.length, 20)
+  assert.equal(first.page, 0)
+  assert.equal(first.pageCount, 3)
+  assert.equal(first.total, 45)
+
+  const last = Model.paginateFindings(findings, 2, 20)
+  assert.equal(last.items.length, 5)
+  assert.equal(last.page, 2)
+})
+
+test("paginateFindings clamps an out-of-range page instead of returning empty", () => {
+  const findings = Array.from({ length: 5 }, (_, i) => ({ id: "CVE-" + i }))
+  const result = Model.paginateFindings(findings, 99, 20)
+  assert.equal(result.page, 0)
+  assert.equal(result.items.length, 5)
+})
+
+test("paginateFindings never breaks on an empty list", () => {
+  const result = Model.paginateFindings([], 0, 20)
+  assert.deepEqual(result, { items: [], page: 0, pageCount: 1, total: 0 })
 })
 
 // ---- New-since-last-scan detection ----------------------------------------
@@ -495,6 +587,138 @@ test("discovery finds real projects under a root and prunes node_modules", () =>
     const discovered = Model.parseDiscoveredProjects(stdout)
     const labels = discovered.map(d => d.label).sort()
     assert.deepEqual(labels, ["cli-tool", "webapp"])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("discovery finds a .csproj nested past the old maxdepth 3 with no shallow .sln to save it", () => {
+  // Regression test for a real bug: a .NET repo laid out as the common
+  // `RepoRoot/src/ProjectName/ProjectName.csproj` sits 4 levels below a
+  // discoverRoot that's the *parent* of RepoRoot — one past where the old
+  // `-maxdepth 3` would still look. A real clone was only saved by also
+  // having a root .sln at depth 2; this fixture has no root manifest at
+  // all, so it would have been silently skipped before the fix to depth 5.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-discovery-deep-"))
+  try {
+    const projectDir = path.join(root, "RepoRoot", "src", "ProjectName")
+    fs.mkdirSync(projectDir, { recursive: true })
+    fs.writeFileSync(path.join(projectDir, "ProjectName.csproj"), "")
+
+    const script = Model.buildDiscoveryScript([root])
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const discovered = Model.parseDiscoveredProjects(stdout)
+    assert.equal(discovered.length, 1)
+    assert.equal(discovered[0].label, "ProjectName")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("discovery collapses .csproj files nested under their own .sln into one project", () => {
+  // Regression test for a real repo shape found live: MockServer.API.sln
+  // at the root, plus a separate .csproj under src/<ProjectName>/ for
+  // each project the solution references. Before this fix, deeper
+  // discovery (maxdepth 5) reported the root repo *and* every nested
+  // .csproj as its own "project" — 5 redundant entries for one repo,
+  // since `dotnet list package --vulnerable` at the .sln's directory
+  // already covers everything the solution references.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-discovery-sln-"))
+  try {
+    fs.mkdirSync(path.join(root, "mock-server"), { recursive: true })
+    fs.writeFileSync(path.join(root, "mock-server", "MockServer.API.sln"), "")
+    for (const name of ["MockServer.API", "MockServer.Data", "MockServer.Models"]) {
+      const projectDir = path.join(root, "mock-server", "src", name)
+      fs.mkdirSync(projectDir, { recursive: true })
+      fs.writeFileSync(path.join(projectDir, name + ".csproj"), "")
+    }
+
+    const script = Model.buildDiscoveryScript([root])
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const discovered = Model.parseDiscoveredProjects(stdout)
+    assert.equal(discovered.length, 1)
+    assert.equal(discovered[0].label, "mock-server")
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("discovery collapses lockfile-less workspace members into their root, but keeps independently-locked nested repos", () => {
+  // Regression test for a real repo shape found live: a yarn workspace
+  // (Backstage-style) with a root package.json+yarn.lock declaring
+  // `workspaces: ["packages/*", "plugins/*"]`, plus workspace members
+  // packages/app and packages/backend with no lockfile of their own, plus
+  // an unrelated scaffold package.json (examples/template/content) that's
+  // a template placeholder with no real deps and no lockfile either.
+  // Before this fix, all 4 discovered as separate "projects" — the 3
+  // lockfile-less ones fell back to a broken plain `npm audit` (no
+  // package-lock.json to audit against), reported as "many entries, no
+  // results". Also verifies a *sibling* project with its own lockfile,
+  // nested under the same discoverRoot but not inside the workspace root,
+  // is correctly kept — only a lockfile-less package.json covered by an
+  // ancestor's own package.json+lockfile gets dropped.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-discovery-workspace-"))
+  try {
+    const repoRoot = path.join(root, "internal-dev-portal")
+    fs.mkdirSync(repoRoot, { recursive: true })
+    fs.writeFileSync(path.join(repoRoot, "package.json"), JSON.stringify({ workspaces: ["packages/*"] }))
+    fs.writeFileSync(path.join(repoRoot, "yarn.lock"), "")
+
+    for (const name of ["app", "backend"]) {
+      const memberDir = path.join(repoRoot, "packages", name)
+      fs.mkdirSync(memberDir, { recursive: true })
+      fs.writeFileSync(path.join(memberDir, "package.json"), "{}")
+    }
+
+    const templateDir = path.join(repoRoot, "examples", "template", "content")
+    fs.mkdirSync(templateDir, { recursive: true })
+    fs.writeFileSync(path.join(templateDir, "package.json"), '{"name":"${{ values.name }}"}')
+
+    const standaloneDir = path.join(root, "other-service")
+    fs.mkdirSync(standaloneDir, { recursive: true })
+    fs.writeFileSync(path.join(standaloneDir, "package.json"), "{}")
+    fs.writeFileSync(path.join(standaloneDir, "package-lock.json"), "{}")
+
+    const script = Model.buildDiscoveryScript([root])
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const discovered = Model.parseDiscoveredProjects(stdout)
+    const labels = discovered.map(d => d.label).sort()
+    assert.deepEqual(labels, ["internal-dev-portal", "other-service"])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test("discovery collapses lockfile-less Cargo workspace members into their root", () => {
+  // Regression test verified against a real cargo workspace: `cargo audit`
+  // run inside a member crate directory (which has no Cargo.lock of its
+  // own — only the workspace root does) fails outright ("Couldn't load
+  // Cargo.lock"), unlike a genuinely standalone crate with no committed
+  // lockfile (cargo auto-generates one on the fly and audits fine — it's
+  // specifically being inside a workspace that breaks it). Same coverage
+  // rule as the JS workspace case above, applied to Cargo.toml/Cargo.lock.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "depaudit-discovery-cargo-ws-"))
+  try {
+    const wsRoot = path.join(root, "my-workspace")
+    fs.mkdirSync(wsRoot, { recursive: true })
+    fs.writeFileSync(path.join(wsRoot, "Cargo.toml"), '[workspace]\nmembers = ["crate-a", "crate-b"]\n')
+    fs.writeFileSync(path.join(wsRoot, "Cargo.lock"), "")
+
+    for (const name of ["crate-a", "crate-b"]) {
+      const memberDir = path.join(wsRoot, name)
+      fs.mkdirSync(memberDir, { recursive: true })
+      fs.writeFileSync(path.join(memberDir, "Cargo.toml"), '[package]\nname = "' + name + '"\n')
+    }
+
+    const standaloneDir = path.join(root, "standalone-crate")
+    fs.mkdirSync(standaloneDir, { recursive: true })
+    fs.writeFileSync(path.join(standaloneDir, "Cargo.toml"), '[package]\nname = "standalone-crate"\n')
+
+    const script = Model.buildDiscoveryScript([root])
+    const stdout = execFileSync("bash", ["-c", script], { encoding: "utf8" })
+    const discovered = Model.parseDiscoveredProjects(stdout)
+    const labels = discovered.map(d => d.label).sort()
+    assert.deepEqual(labels, ["my-workspace", "standalone-crate"])
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

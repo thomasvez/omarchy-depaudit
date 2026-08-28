@@ -12,12 +12,11 @@ both).
 No dashboard, no daemon: a shield icon in the bar shows the total finding
 count, color-coded by worst severity, and only notifies when something
 *new* shows up — not on every routine scan. Clicking it opens a per-repo
-breakdown, one collapsible section per project — a severity-count summary
-(e.g. "2 critical  1 high") whether collapsed or expanded, and the full
-list when expanded: package name, current vs. fixed version, severity, the
-CVE number (or native advisory id when no CVE was assigned), and a
-click-to-copy fix command. Findings you've already triaged can be dismissed
-without losing track of them.
+list, each row showing a severity-count summary (e.g. "2 critical  1
+high") without opening it — click a repo to see its findings in a
+dedicated, filterable, paginated detail view: package name, current vs.
+fixed version, severity, the CVE number (or native advisory id when no CVE
+was assigned), and a click-to-copy fix command.
 
 ![Panel preview: one expanded repo section showing two npm findings with
 severity, CVE/GHSA links, and copy-fix commands, plus two collapsed
@@ -48,15 +47,21 @@ omarchy plugin add https://github.com/thomasvez/omarchy-depaudit.git --enable
 - **Click the ⚙ in the panel header**: open the settings form — edit icon,
   refresh interval, discover roots, and projects without touching
   shell.json (**✕** or **Cancel** discards changes, **Save** persists them)
-- **Click a repo's header** in the panel: expand/collapse its finding list
-  (starts collapsed; the severity-count row next to the header stays
-  visible either way)
-- **Click the ⟳ next to a repo's header**: re-audit just that one project
+- **Click the 🔎 in the panel header** (only shown when discoverRoots is
+  configured): scan for new projects only — re-runs discovery and audits
+  just what's newly found, without re-checking every already-known
+  project. Middle click / **`r`** re-audits everything; this is for "did I
+  just clone something new" without paying for a full rescan.
+- **Click a repo's header** in the panel: open its findings in a dedicated,
+  wider detail view (the severity-count row next to the header in the list
+  is always visible, so you can see whether a repo's a problem without
+  opening it) — with severity filter chips and pagination (20 per page),
+  so even a repo with thousands of findings stays responsive. **‹ Back**
+  or Escape returns to the list.
+- **Click the ⟳** — next to a repo's header in the list, or in the detail
+  view's header once it's open: re-audit just that one project
 - **Click a finding**'s CVE/advisory id in the panel: open that advisory's
   page in the browser
-- **Click "Dismiss"** on a finding: exclude it from the badge count and
-  severity summary without deleting it — it stays in the list, dimmed,
-  with the control now reading "Restore"
 - **Click anywhere else** on a finding: copy its fix command to the
   clipboard
 
@@ -105,11 +110,10 @@ config file. Or add either (or both) to this widget's block in
   to running them often.
 - `icon` — bar glyph, default `🛡`.
 
-Dismissed findings and each repo's "last seen" baseline (for new-finding
-notifications) are stored separately from this config, at
-`~/.local/state/omarchy-depaudit/state.json` — not something you're
-expected to hand-edit, but delete it if you ever want a clean slate (every
-finding un-dismissed, next scan's findings treated as a fresh baseline
+Each repo's "last seen" baseline (for new-finding notifications) is stored
+separately from this config, at `~/.local/state/omarchy-depaudit/state.json`
+— not something you're expected to hand-edit, but delete it if you ever
+want a clean slate (next scan's findings treated as a fresh baseline
 rather than compared against history).
 
 Move it in the bar:

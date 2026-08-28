@@ -99,60 +99,79 @@ Panel {
   // once on startup/open) for anyone who wants manual/middle-click-only.
   readonly property int refreshMinutes: Math.max(0, parseInt(setting("refreshIntervalMinutes", 60), 10) || 0)
 
-  // Raw scan results, before ignore-annotation. `repos` (below) is what the
-  // UI and the badge actually read — always derived from this plus
-  // `ignoredMap`, so toggling ignore state updates the display without
-  // needing a new scan.
+  // Raw scan results — what the UI and the badge read directly.
   property var rawRepos: []
   property bool refreshing: false
   property double lastRefreshedAt: 0
 
-  readonly property var repos: Model.markIgnored(root.rawRepos, root.ignoredMap)
+  readonly property var repos: root.rawRepos
   readonly property var summary: Model.aggregate(root.repos)
   readonly property int total: summary.total
   readonly property string worstSeverity: summary.worstSeverity
 
-  // Collapsed/expanded state per repo, keyed by path (stable across a
-  // refresh even though `repos` itself is a freshly-built array each time).
-  // Every repo starts collapsed — that's the whole point of this map, so a
-  // long project list doesn't dump every finding on screen at once; the
-  // severity-count row below the header covers "is this one a problem"
-  // without expanding it.
-  property var expandedPaths: ({})
+  // ---- Repo detail view: clicking a repo in the list opens its findings
+  //      in a dedicated, much larger view instead of expanding inline —
+  //      a repo with a lot of findings made the inline expand genuinely
+  //      slow (every finding's Rectangle+Column+MouseAreas built at once,
+  //      reflowing the whole popup's height). Paginating (detailPageSize
+  //      per page, see below) caps how many finding delegates ever exist
+  //      at once regardless of how large a repo's real finding count is.
+  property string detailPath: ""
+  property string detailSeverity: "all"
+  property int detailPage: 0
+  readonly property int detailPageSize: 20
 
-  function isExpanded(path) {
-    return root.expandedPaths[path] === true
+  function findRepo(path) {
+    for (var i = 0; i < root.repos.length; i++) {
+      if (root.repos[i].path === path) return root.repos[i]
+    }
+    return null
   }
 
-  function toggleExpanded(path) {
-    // Reassign a new object rather than mutate in place — `expandedPaths`
-    // is a plain `property var`, and QML only fires change notifications
-    // (which `isExpanded` bindings depend on to update) on reassignment.
-    var next = {}
-    for (var k in root.expandedPaths) next[k] = root.expandedPaths[k]
-    next[path] = !root.expandedPaths[path]
-    root.expandedPaths = next
+  function findEffectiveIndex(path) {
+    for (var i = 0; i < root.effectiveProjects.length; i++) {
+      if (root.effectiveProjects[i].path === path) return i
+    }
+    return -1
   }
 
-  // ---- Ignored findings + new-finding baselines: persisted locally (not
-  //      into shell.json — this is scan-derived state, not configuration a
-  //      person would hand-edit) at ~/.local/state/omarchy-depaudit/
-  //      state.json. The directory is created by every generated script's
-  //      shared setup prefix (see Model.js's PATH_PREFIX/STATE_DIR) before
-  //      this FileView could ever need to write into it.
+  readonly property var detailRepo: root.findRepo(root.detailPath)
+  readonly property var detailAllCounts: root.detailRepo ? Model.countBySeverity(root.detailRepo.findings) : ({})
+  readonly property var detailFiltered: root.detailRepo ? Model.filterFindings(root.detailRepo.findings, root.detailSeverity) : []
+  readonly property var detailPaged: Model.paginateFindings(root.detailFiltered, root.detailPage, root.detailPageSize)
+
+  function openDetail(path) {
+    root.detailPath = path
+    root.detailSeverity = "all"
+    root.detailPage = 0
+  }
+
+  function closeDetail() {
+    root.detailPath = ""
+  }
+
+  function setDetailSeverity(severity) {
+    root.detailSeverity = severity
+    root.detailPage = 0
+  }
+
+  // ---- New-finding baselines: persisted locally (not into shell.json —
+  //      this is scan-derived state, not configuration a person would
+  //      hand-edit) at ~/.local/state/omarchy-depaudit/state.json. The
+  //      directory is created by every generated script's shared setup
+  //      prefix (see Model.js's PATH_PREFIX/STATE_DIR) before this
+  //      FileView could ever need to write into it.
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy-depaudit"
-  property var ignoredMap: ({})
   property var lastSeenMap: ({})
 
   function applyState(raw) {
     var parsed = null
     try { parsed = JSON.parse(raw) } catch (e) { parsed = null }
-    root.ignoredMap = (parsed && typeof parsed.ignored === "object" && parsed.ignored) || {}
     root.lastSeenMap = (parsed && typeof parsed.lastSeen === "object" && parsed.lastSeen) || {}
   }
 
   function persistState() {
-    stateFile.setText(JSON.stringify({ ignored: root.ignoredMap, lastSeen: root.lastSeenMap }, null, 2) + "\n")
+    stateFile.setText(JSON.stringify({ lastSeen: root.lastSeenMap }, null, 2) + "\n")
   }
 
   FileView {
@@ -162,11 +181,6 @@ Panel {
     printErrors: false
     onLoaded: root.applyState(text())
     onLoadFailed: root.applyState("")
-  }
-
-  function toggleIgnoreFinding(path, id) {
-    root.ignoredMap = Model.toggleIgnored(root.ignoredMap, path, id)
-    root.persistState()
   }
 
   // Compares a batch of just-scanned repos against their previous baseline,
@@ -183,8 +197,22 @@ Panel {
     root.persistState()
   }
 
+  function anyProcRunning() {
+    return auditProc.running || singleProc.running || discoveryProc.running ||
+      newProjectsProc.running || newAuditProc.running
+  }
+
   function refresh() {
-    if (auditProc.running || singleProc.running || discoveryProc.running) return
+    if (root.anyProcRunning()) return
+    // Shows the project list immediately instead of leaving it blank
+    // (first run) or stale (re-run) while discovery/audit — both
+    // potentially slow — are still in flight: a project already scanned
+    // keeps its real result, anything newly configured shows as
+    // "pending" until its own marker shows up in the audit script's
+    // output. Only reflects `projects` at this point since discovery
+    // hasn't run yet; discoveryProc's own completion below updates it
+    // again once discovered projects are known too.
+    root.rawRepos = Model.buildPendingRepos(root.effectiveProjects, root.rawRepos)
     if (root.discoverRoots.length === 0) {
       root.discoveredProjects = []
       root.runAudit()
@@ -200,6 +228,7 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         root.discoveredProjects = Model.parseDiscoveredProjects(String(text || ""))
+        root.rawRepos = Model.buildPendingRepos(root.effectiveProjects, root.rawRepos)
         root.runAudit()
       }
     }
@@ -241,7 +270,7 @@ Panel {
 
   function refreshOne(index) {
     if (index < 0 || index >= root.effectiveProjects.length) return
-    if (auditProc.running || singleProc.running || discoveryProc.running) return
+    if (root.anyProcRunning()) return
     root.singleRefreshIndex = index
     singleProc.command = ["bash", "-c", Model.buildAuditScript([root.effectiveProjects[index]])]
     singleProc.running = true
@@ -261,6 +290,92 @@ Panel {
         root.rawRepos = next
         root.lastRefreshedAt = Date.now()
         root.checkNewFindings(updated)
+      }
+    }
+  }
+
+  // ---- Scan for new projects only: re-runs discovery against
+  //      discoverRoots, but — unlike refresh(), which re-audits every
+  //      configured project — audits only the ones not already in
+  //      rawRepos. Existing repos' results are left untouched. This is
+  //      what a large discoverRoots tree actually
+  //      needs: refresh() re-checking every already-known repo's CVEs is
+  //      the right thing on a timer/manual refresh, but "did I just clone
+  //      something new" shouldn't have to pay for re-auditing everything
+  //      else too.
+  property string newProjectsStatus: ""
+  property var pendingNewProjects: []
+
+  function scanForNewProjects() {
+    if (root.anyProcRunning()) return
+    if (root.discoverRoots.length === 0) {
+      root.newProjectsStatus = "No discoverRoots configured"
+      return
+    }
+    root.newProjectsStatus = "Scanning for new projects…"
+    newProjectsProc.command = ["bash", "-c", Model.buildDiscoveryScript(root.discoverRoots)]
+    newProjectsProc.running = true
+  }
+
+  Process {
+    id: newProjectsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var knownPaths = {}
+        for (var i = 0; i < root.rawRepos.length; i++) knownPaths[root.rawRepos[i].path] = true
+        root.discoveredProjects = Model.parseDiscoveredProjects(String(text || ""))
+        var fresh = []
+        var merged = root.effectiveProjects
+        for (var j = 0; j < merged.length; j++) {
+          if (!knownPaths[merged[j].path]) fresh.push(merged[j])
+        }
+        if (fresh.length === 0) {
+          root.newProjectsStatus = "No new projects found"
+          return
+        }
+        root.newProjectsStatus = "Auditing " + fresh.length + " new project" + (fresh.length === 1 ? "" : "s") + "…"
+        root.pendingNewProjects = fresh
+        // Shows the newly found project(s) in the list right away, as
+        // "pending", instead of only appearing once their own (separate,
+        // possibly slow) audit script finishes.
+        root.rawRepos = Model.buildPendingRepos(root.effectiveProjects, root.rawRepos)
+        newAuditProc.command = ["bash", "-c", Model.buildAuditScript(fresh)]
+        newAuditProc.running = true
+      }
+    }
+  }
+
+  Process {
+    id: newAuditProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var fresh = root.pendingNewProjects
+        root.pendingNewProjects = []
+        var scanned = Model.parseAuditOutput(String(text || ""), fresh)
+
+        // refreshOne/singleProc index a repo by its position in
+        // effectiveProjects, so rawRepos must stay ordered the same way —
+        // a newly discovered project can land anywhere within the
+        // discovered segment (find's traversal order, not append order),
+        // not necessarily at the end, so a plain concat here would
+        // desync that index alignment for any refreshOne() called before
+        // the next full refresh() rebuilds rawRepos from scratch anyway.
+        var byPath = {}
+        for (var i = 0; i < root.rawRepos.length; i++) byPath[root.rawRepos[i].path] = root.rawRepos[i]
+        for (var j = 0; j < scanned.length; j++) byPath[scanned[j].path] = scanned[j]
+        var merged = root.effectiveProjects
+        var next = []
+        for (var k = 0; k < merged.length; k++) {
+          var p = byPath[merged[k].path]
+          if (p) next.push(p)
+        }
+        root.rawRepos = next
+
+        root.lastRefreshedAt = Date.now()
+        root.newProjectsStatus = scanned.length + " new project" + (scanned.length === 1 ? "" : "s") + " found"
+        root.checkNewFindings(scanned)
       }
     }
   }
@@ -316,6 +431,7 @@ Panel {
     root.draftDiscoverRootsText = Model.rootsToText(root.discoverRoots)
     root.draftProjectsText = Model.projectsToText(root.projects)
     root.settingsError = ""
+    root.newProjectsStatus = ""
     root.settingsOpen = true
   }
 
@@ -388,6 +504,104 @@ Panel {
     }
   }
 
+  // One finding row — used by the repo detail view's paginated Repeater.
+  // A `component` block can't see ids from the rest of this file (`root`
+  // included), so everything it needs (colors, the copy/open-url/dismiss
+  // actions) comes in as an explicit property rather than reaching out to
+  // `root.*` directly, the way the rest of this file does.
+  component DepauditFindingRow: Rectangle {
+    id: findingItem
+    property var finding: null
+    property color fg: Color.foreground
+    property string fontFam: Style.font.family
+    property var copyFixFn: function(command) {}
+    property var openUrlFn: function(url) {}
+
+    height: findingCol.implicitHeight + Style.space(10)
+    radius: Style.cornerRadius
+    color: findingArea.containsMouse ? Style.hoverFillFor(findingItem.fg, Color.accent) : "transparent"
+
+    // Background click target: anywhere on the row not over a more
+    // specific control (the id/CVE link below) copies the fix command.
+    // Declared before findingCol so the column's content — including the
+    // id link's own MouseArea — stacks on top of this one for both
+    // painting and hit-testing.
+    MouseArea {
+      id: findingArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: findingItem.copyFixFn(findingItem.finding.fixCommand)
+    }
+
+    Column {
+      id: findingCol
+      x: Style.space(6)
+      y: Style.space(5)
+      width: parent.width - Style.space(12)
+      spacing: Style.space(2)
+
+      Row {
+        spacing: Style.space(8)
+
+        Text {
+          text: "[" + Model.severityLabel(findingItem.finding.severity) + "]"
+          color: Model.severityColor(findingItem.finding.severity) || Qt.darker(findingItem.fg, 1.5)
+          font.family: findingItem.fontFam
+          font.pixelSize: Style.font.caption
+          font.bold: true
+        }
+
+        Text {
+          text: findingItem.finding.package + (findingItem.finding.fixedVersion
+            ? ("  " + findingItem.finding.range + " → " + findingItem.finding.fixedVersion)
+            : ("  " + findingItem.finding.range))
+          color: findingItem.fg
+          font.family: findingItem.fontFam
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        // ---- CVE (preferred) or native advisory id, opening the
+        //      advisory's page in the browser on click. idArea sits on top
+        //      of the row's background copy-fix area since this Text is a
+        //      descendant of findingCol, declared after findingArea.
+        Text {
+          visible: findingItem.finding.id !== ""
+          text: findingItem.finding.id
+          color: idArea.containsMouse ? Color.accent : Qt.darker(Color.accent, 1.2)
+          font.family: findingItem.fontFam
+          font.pixelSize: Style.font.bodySmall
+          font.underline: idArea.containsMouse
+
+          MouseArea {
+            id: idArea
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: findingItem.openUrlFn(findingItem.finding.url)
+          }
+        }
+      }
+
+      Text {
+        visible: text !== ""
+        text: findingItem.finding.title
+        color: Qt.darker(findingItem.fg, 1.5)
+        font.family: findingItem.fontFam
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        width: findingCol.width
+      }
+
+      Text {
+        text: "Copy fix: " + findingItem.finding.fixCommand
+        color: Color.accent
+        font.family: findingItem.fontFam
+        font.pixelSize: Style.font.caption
+      }
+    }
+  }
+
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -396,8 +610,12 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(600))
-    contentHeight: panel.fittedContentHeight(bodyCol.implicitHeight, Style.space(520))
+    // Wider/taller while a repo's detail view is open — that's the whole
+    // point of it being a separate view rather than an inline expand: room
+    // for the filter chips + a real page of findings without the popup
+    // feeling cramped.
+    contentWidth: panel.fittedContentWidth(Style.space(root.detailPath !== "" ? 860 : 600))
+    contentHeight: panel.fittedContentHeight(bodyCol.implicitHeight, Style.space(root.detailPath !== "" ? 640 : 520))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -408,7 +626,10 @@ Panel {
       // editor elsewhere in this shell (Keys.priority: Keys.BeforeItem
       // otherwise intercepts before the field ever sees the keystroke).
       blocked: root.settingsOpen
-      onCloseRequested: root.close()
+      // Escape steps back out of the detail view first (it's a drill-down,
+      // not a separate dismissable surface) rather than closing the whole
+      // panel from under it.
+      onCloseRequested: root.detailPath !== "" ? root.closeDetail() : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) { if (t === "r" || t === "R") root.refresh() }
 
@@ -437,13 +658,13 @@ Panel {
             Row {
               id: mainHeaderRow
               anchors.left: parent.left
-              anchors.right: settingsBtn.left
+              anchors.right: scanNewBtn.visible ? scanNewBtn.left : settingsBtn.left
               anchors.rightMargin: Style.space(8)
               spacing: Style.space(8)
 
               Text {
                 text: root.total > 0
-                  ? (root.total + " finding" + (root.total === 1 ? "" : "s") + " · worst: " + root.worstSeverity)
+                  ? (root.total + " finding" + (root.total === 1 ? "" : "s") + " · worst: " + Model.severityLabel(root.worstSeverity))
                   : "No known dependency findings"
                 color: root.fg
                 font.family: root.fontFam
@@ -459,6 +680,42 @@ Panel {
                 font.pixelSize: Style.font.caption
                 font.italic: true
                 anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                visible: !root.refreshing && root.newProjectsStatus !== ""
+                text: root.newProjectsStatus
+                color: Qt.darker(root.fg, 1.5)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+                font.italic: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            // Re-runs discovery and audits only newly found projects,
+            // leaving already-scanned repos untouched — see
+            // scanForNewProjects() below. Only meaningful (and shown) when
+            // discoverRoots is actually configured; a bare `projects` list
+            // has nothing for it to discover.
+            Text {
+              id: scanNewBtn
+              visible: !root.settingsOpen && root.discoverRoots.length > 0
+              anchors.right: settingsBtn.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: mainHeaderRow.verticalCenter
+              text: (newProjectsProc.running || newAuditProc.running) ? "…" : "🔎"
+              color: scanNewBtnArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
+              font.family: root.fontFam
+              font.pixelSize: Style.font.body
+
+              MouseArea {
+                id: scanNewBtnArea
+                anchors.fill: parent
+                anchors.margins: -Style.space(4)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.scanForNewProjects()
               }
             }
 
@@ -593,15 +850,19 @@ Panel {
             font.italic: true
           }
 
-          // ---- One collapsible section per configured repo. Collapsed by
-          //      default: the severity-count row right under the header is
-          //      what keeps a long project list from being a wall of
-          //      findings — it answers "is this one a problem" without
-          //      expanding it. Click the header to expand for the full
-          //      finding list; click the rescan glyph to re-audit just this
-          //      repo instead of every configured project.
+          // ---- One row per configured repo, collapsed to just its header
+          //      and severity-count summary — that's what keeps a long
+          //      project list from being a wall of findings, and it
+          //      answers "is this one a problem" without opening it.
+          //      Click the header to open its findings in a dedicated
+          //      detail view (see the Column below this Repeater, gated on
+          //      root.detailPath) — a separate view rather than expanding
+          //      inline, since a repo with a lot of findings made an
+          //      inline expand genuinely slow. Click the rescan glyph to
+          //      re-audit just this repo instead of every configured
+          //      project.
           Repeater {
-            model: root.settingsOpen ? [] : root.repos
+            model: (root.settingsOpen || root.detailPath !== "") ? [] : root.repos
 
             Column {
               id: repoSection
@@ -610,7 +871,6 @@ Panel {
               width: bodyCol.width
               spacing: Style.space(6)
 
-              readonly property bool expanded: root.isExpanded(modelData.path)
               readonly property var counts: Model.countBySeverity(modelData.findings)
               readonly property bool hasFindings: modelData.status === "ok" && modelData.findings.length > 0
               readonly property bool refreshingThis: root.singleRefreshIndex === index
@@ -622,23 +882,33 @@ Panel {
                 opacity: 0.12
               }
 
-              // ---- Header: chevron + severity dot + label + path on the
+              // ---- Header: arrow + severity dot + label + path on the
               //      left, rescan glyph pinned to the right. The whole row
-              //      is the expand/collapse click target; the rescan glyph
-              //      is a descendant declared after that background
-              //      MouseArea, so it stacks on top for hit-testing (same
-              //      pattern the finding rows below use for their id/CVE
-              //      link over the copy-fix background).
+              //      opens the detail view — a hover background (same
+              //      Style.hoverFillFor treatment finding rows use) plus an
+              //      accent-colored, bolder arrow make that discoverable
+              //      without hovering first to notice the cursor change.
+              //      The rescan glyph is a descendant declared after the
+              //      background MouseArea, so it stacks on top for
+              //      hit-testing (same pattern the finding rows below use
+              //      for their id/CVE link over the copy-fix background).
               Item {
                 id: headerRow
                 width: parent.width
-                height: labelRow.implicitHeight
+                height: labelRow.implicitHeight + Style.space(8)
+
+                Rectangle {
+                  anchors.fill: parent
+                  radius: Style.cornerRadius
+                  color: headerArea.containsMouse ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+                }
 
                 MouseArea {
+                  id: headerArea
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.toggleExpanded(repoSection.modelData.path)
+                  onClicked: root.openDetail(repoSection.modelData.path)
                 }
 
                 // `headerLeft` is an Item, not a Row: a Row sizes itself to
@@ -653,8 +923,10 @@ Panel {
                 Item {
                   id: headerLeft
                   anchors.left: parent.left
+                  anchors.leftMargin: Style.space(4)
                   anchors.right: rescanBtn.left
                   anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
                   height: labelRow.implicitHeight
 
                   Row {
@@ -664,10 +936,11 @@ Panel {
                     spacing: Style.space(8)
 
                     Text {
-                      text: repoSection.expanded ? "▾" : "▸"
-                      color: Qt.darker(root.fg, 1.4)
+                      text: "❯"
+                      color: headerArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
                       font.family: root.fontFam
-                      font.pixelSize: Style.font.caption
+                      font.pixelSize: Style.font.body
+                      font.bold: true
                       anchors.verticalCenter: parent.verticalCenter
                     }
 
@@ -733,7 +1006,7 @@ Panel {
                   Text {
                     required property string modelData
                     visible: repoSection.counts[modelData] > 0
-                    text: repoSection.counts[modelData] + " " + modelData
+                    text: repoSection.counts[modelData] + " " + Model.severityLabel(modelData)
                     color: Model.severityColor(modelData) || Qt.darker(root.fg, 1.5)
                     font.family: root.fontFam
                     font.pixelSize: Style.font.caption
@@ -753,127 +1026,213 @@ Panel {
                 width: parent.width
               }
 
-              // ---- Findings for this repo — only rendered when expanded.
+            }
+          }
+
+          // ---- Repo detail view: opened by clicking a repo above (see
+          //      root.openDetail), replaces the repo list entirely rather
+          //      than sitting alongside it — same "one screen, one job" as
+          //      the settings form. Severity filter chips + pagination
+          //      (root.detailPageSize per page) keep the number of finding
+          //      delegates that ever exist at once small and constant,
+          //      regardless of how many findings the repo actually has.
+          Column {
+            visible: !root.settingsOpen && root.detailPath !== ""
+            width: parent.width
+            spacing: Style.space(10)
+
+            Item {
+              width: parent.width
+              height: detailBackRow.implicitHeight
+
+              Row {
+                id: detailBackRow
+                anchors.left: parent.left
+                anchors.right: detailRescanBtn.left
+                anchors.rightMargin: Style.space(8)
+                spacing: Style.space(10)
+
+                Text {
+                  text: "‹ Back"
+                  color: detailBackArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
+                  font.family: root.fontFam
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  MouseArea {
+                    id: detailBackArea
+                    anchors.fill: parent
+                    anchors.margins: -Style.space(4)
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.closeDetail()
+                  }
+                }
+
+                Text {
+                  text: root.detailRepo ? root.detailRepo.label : root.detailPath
+                  color: root.fg
+                  font.family: root.fontFam
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              Text {
+                id: detailRescanBtn
+                anchors.right: parent.right
+                anchors.verticalCenter: detailBackRow.verticalCenter
+                text: root.singleRefreshIndex === root.findEffectiveIndex(root.detailPath) && root.singleRefreshIndex !== -1 ? "…" : "⟳"
+                color: detailRescanArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.body
+
+                MouseArea {
+                  id: detailRescanArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.refreshOne(root.findEffectiveIndex(root.detailPath))
+                }
+              }
+            }
+
+            Text {
+              visible: root.detailRepo !== null
+              text: root.detailPath
+              color: Qt.darker(root.fg, 1.6)
+              font.family: root.fontFam
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideMiddle
+              width: parent.width
+            }
+
+            Text {
+              visible: root.detailRepo === null
+              text: "This project is no longer in the list."
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fontFam
+              font.pixelSize: Style.font.bodySmall
+              font.italic: true
+            }
+
+            // ---- Severity filter chips, each labeled with how many of
+            //      this repo's findings match, so a chip reading "0" is
+            //      visibly not worth clicking.
+            Flow {
+              visible: root.detailRepo !== null
+              width: parent.width
+              spacing: Style.space(6)
+
               Repeater {
-                model: repoSection.expanded ? repoSection.modelData.findings : []
+                model: Model.SEVERITY_FILTERS
 
                 Rectangle {
-                  id: findingItem
-                  required property var modelData
-                  readonly property var finding: modelData
-                  width: repoSection.width
-                  height: findingCol.implicitHeight + Style.space(10)
-                  radius: Style.cornerRadius
-                  color: findingArea.containsMouse ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+                  id: chip
+                  required property string modelData
+                  readonly property int chipCount: chip.modelData === "all"
+                    ? root.detailFiltered.length
+                    : (root.detailAllCounts[chip.modelData] || 0)
+                  readonly property bool active: root.detailSeverity === chip.modelData
+                  width: chipLabel.implicitWidth + Style.space(16)
+                  height: chipLabel.implicitHeight + Style.space(8)
+                  radius: height / 2
+                  color: chip.active ? Util.alpha(Color.accent, 0.25) : Util.alpha(root.fg, 0.08)
+                  border.width: chip.active ? 1 : 0
+                  border.color: Color.accent
 
-                  // Background click target: anywhere on the row not over a
-                  // more specific control (the id/CVE link below) copies the
-                  // fix command. Declared before findingCol so the column's
-                  // content — including the id link's own MouseArea — stacks
-                  // on top of this one for both painting and hit-testing.
+                  Text {
+                    id: chipLabel
+                    anchors.centerIn: parent
+                    text: Model.severityLabel(chip.modelData) + " (" + chip.chipCount + ")"
+                    color: chip.active ? Color.accent : Qt.darker(root.fg, 1.3)
+                    font.family: root.fontFam
+                    font.pixelSize: Style.font.caption
+                    font.bold: chip.active
+                  }
+
                   MouseArea {
-                    id: findingArea
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onClicked: root.copyFixCommand(findingItem.finding.fixCommand)
+                    onClicked: root.setDetailSeverity(chip.modelData)
                   }
+                }
+              }
+            }
 
-                  Column {
-                    id: findingCol
-                    x: Style.space(6)
-                    y: Style.space(5)
-                    width: parent.width - Style.space(12)
-                    spacing: Style.space(2)
-                    // Ignored findings stay in the list (see
-                    // Model.markIgnored) rather than disappearing —
-                    // reversible and visible, not a silent delete — dimmed
-                    // to read at a glance as "dismissed, not active".
-                    opacity: findingItem.finding.ignored ? 0.45 : 1
+            Text {
+              visible: root.detailRepo !== null && root.detailFiltered.length === 0
+              text: root.detailSeverity === "all" ? "No findings." : "No " + Model.severityLabel(root.detailSeverity) + " findings."
+              color: Qt.darker(root.fg, 1.5)
+              font.family: root.fontFam
+              font.pixelSize: Style.font.bodySmall
+              font.italic: true
+            }
 
-                    Row {
-                      spacing: Style.space(8)
+            Repeater {
+              model: root.detailRepo !== null ? root.detailPaged.items : []
 
-                      Text {
-                        text: "[" + findingItem.finding.severity + "]"
-                        color: Model.severityColor(findingItem.finding.severity) || Qt.darker(root.fg, 1.5)
-                        font.family: root.fontFam
-                        font.pixelSize: Style.font.caption
-                        font.bold: true
-                      }
+              DepauditFindingRow {
+                width: bodyCol.width
+                finding: modelData
+                fg: root.fg
+                fontFam: root.fontFam
+                copyFixFn: root.copyFixCommand
+                openUrlFn: root.openFindingUrl
+              }
+            }
 
-                      Text {
-                        text: findingItem.finding.package + (findingItem.finding.fixedVersion
-                          ? ("  " + findingItem.finding.range + " → " + findingItem.finding.fixedVersion)
-                          : ("  " + findingItem.finding.range))
-                        color: root.fg
-                        font.family: root.fontFam
-                        font.pixelSize: Style.font.bodySmall
-                      }
+            // ---- Pager: only shown once there's more than one page —
+            //      most repos with a handful of findings never need it.
+            Row {
+              visible: root.detailRepo !== null && root.detailPaged.pageCount > 1
+              spacing: Style.space(14)
 
-                      // ---- CVE (preferred) or native advisory id, opening
-                      //      the advisory's page in the browser on click.
-                      //      idArea sits on top of the row's background
-                      //      copy-fix area since this Text is a descendant
-                      //      of findingCol, declared after findingArea.
-                      Text {
-                        visible: findingItem.finding.id !== ""
-                        text: findingItem.finding.id
-                        color: idArea.containsMouse ? Color.accent : Qt.darker(Color.accent, 1.2)
-                        font.family: root.fontFam
-                        font.pixelSize: Style.font.bodySmall
-                        font.underline: idArea.containsMouse
+              Text {
+                text: "‹ Prev"
+                color: root.detailPaged.page > 0
+                  ? (detailPrevArea.containsMouse ? Color.accent : root.fg)
+                  : Qt.darker(root.fg, 1.8)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
 
-                        MouseArea {
-                          id: idArea
-                          anchors.fill: parent
-                          hoverEnabled: true
-                          cursorShape: Qt.PointingHandCursor
-                          onClicked: root.openFindingUrl(findingItem.finding.url)
-                        }
-                      }
-                    }
+                MouseArea {
+                  id: detailPrevArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  enabled: root.detailPaged.page > 0
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.detailPage = root.detailPaged.page - 1
+                }
+              }
 
-                    Text {
-                      visible: text !== ""
-                      text: findingItem.finding.title
-                      color: Qt.darker(root.fg, 1.5)
-                      font.family: root.fontFam
-                      font.pixelSize: Style.font.caption
-                      wrapMode: Text.WordWrap
-                      width: findingCol.width
-                    }
+              Text {
+                text: "Page " + (root.detailPaged.page + 1) + " of " + root.detailPaged.pageCount + " · " + root.detailPaged.total + " findings"
+                color: Qt.darker(root.fg, 1.5)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
+              }
 
-                    Row {
-                      spacing: Style.space(10)
+              Text {
+                text: "Next ›"
+                color: root.detailPaged.page < root.detailPaged.pageCount - 1
+                  ? (detailNextArea.containsMouse ? Color.accent : root.fg)
+                  : Qt.darker(root.fg, 1.8)
+                font.family: root.fontFam
+                font.pixelSize: Style.font.caption
 
-                      Text {
-                        text: "Copy fix: " + findingItem.finding.fixCommand
-                        color: Color.accent
-                        font.family: root.fontFam
-                        font.pixelSize: Style.font.caption
-                      }
-
-                      // ---- Dismiss/restore, same on-top-of-background
-                      //      pattern as the id/CVE link above.
-                      Text {
-                        text: findingItem.finding.ignored ? "Restore" : "Dismiss"
-                        color: dismissArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.4)
-                        font.family: root.fontFam
-                        font.pixelSize: Style.font.caption
-                        font.underline: dismissArea.containsMouse
-
-                        MouseArea {
-                          id: dismissArea
-                          anchors.fill: parent
-                          anchors.margins: -Style.space(3)
-                          hoverEnabled: true
-                          cursorShape: Qt.PointingHandCursor
-                          onClicked: root.toggleIgnoreFinding(repoSection.modelData.path, findingItem.finding.id)
-                        }
-                      }
-                    }
-                  }
+                MouseArea {
+                  id: detailNextArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(4)
+                  enabled: root.detailPaged.page < root.detailPaged.pageCount - 1
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.detailPage = root.detailPaged.page + 1
                 }
               }
             }
