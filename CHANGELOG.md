@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0
+
+- Supported ecosystems are now visible in the plugin itself, not just the
+  README: a "Supports: npm · pnpm · yarn · cargo · pip · Go · Ruby · .NET"
+  caption sits under the panel header, always visible regardless of state.
+  Backed by one `Model.SUPPORTED_ECOSYSTEMS` list so the panel and
+  `manifest.json`'s description (which the marketplace catalog card
+  displays) can't drift apart from what the plugin actually detects.
+- Updated `manifest.json`'s description and `barWidget.description` to
+  name every supported ecosystem explicitly, in preparation for listing on
+  the Omarchy plugin marketplace.
+- 1 new test (52 total).
+
 ## 0.8.0
 
 - Added an in-panel settings form: click the ⚙ next to the header to edit

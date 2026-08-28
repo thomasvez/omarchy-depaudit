@@ -542,3 +542,12 @@ test("rootsToText/parseRootsText round-trip", () => {
   const roots = ["/a", "/b"]
   assert.deepEqual(Model.parseRootsText(Model.rootsToText(roots)), roots)
 })
+
+// ---- Supported-ecosystems caption -----------------------------------------
+
+test("supportedEcosystemsText names every ecosystem this plugin actually detects", () => {
+  const text = Model.supportedEcosystemsText()
+  for (const eco of ["npm", "pnpm", "yarn", "cargo", "pip", "Go", "Ruby", ".NET"]) {
+    assert.ok(text.includes(eco), `expected "${text}" to mention ${eco}`)
+  }
+})

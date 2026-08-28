@@ -36,6 +36,16 @@ function defaultProjects() {
   return []
 }
 
+// Single source of truth for "what does this plugin actually cover" —
+// used both for the panel's own always-visible caption and (kept manually
+// in sync) manifest.json's description, since the marketplace catalog
+// displays that description as the first thing a browsing user sees.
+var SUPPORTED_ECOSYSTEMS = ["npm", "pnpm", "yarn", "cargo", "pip", "Go", "Ruby", ".NET"]
+
+function supportedEcosystemsText() {
+  return "Supports: " + SUPPORTED_ECOSYSTEMS.join(" · ")
+}
+
 // Builds one bash script that, for each configured project, detects its
 // package manager by manifest file, checks the matching audit tool is on
 // PATH, and runs it. Detection follows NOTES.md's mapping: package.json ->
@@ -999,6 +1009,8 @@ if (typeof module !== "undefined") {
     pickCveAlias: pickCveAlias,
     plainText: plainText,
     defaultProjects: defaultProjects,
+    SUPPORTED_ECOSYSTEMS: SUPPORTED_ECOSYSTEMS,
+    supportedEcosystemsText: supportedEcosystemsText,
     buildAuditScript: buildAuditScript,
     parseAuditOutput: parseAuditOutput,
     parseNpmAudit: parseNpmAudit,

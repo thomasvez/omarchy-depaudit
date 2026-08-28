@@ -482,6 +482,16 @@ Panel {
             }
           }
 
+          // Always visible regardless of state (settings open, empty,
+          // populated) — a first-glance answer to "what does this even
+          // audit", not buried in the README.
+          Text {
+            text: Model.supportedEcosystemsText()
+            color: Qt.darker(root.fg, 1.5)
+            font.family: root.fontFam
+            font.pixelSize: Style.font.caption
+          }
+
           // ---- Settings form — replaces the finding list while open.
           Column {
             visible: root.settingsOpen
