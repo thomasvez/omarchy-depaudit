@@ -18,18 +18,20 @@ dedicated, filterable, paginated detail view: package name, current vs.
 fixed version, severity, the CVE number (or native advisory id when no CVE
 was assigned), and a click-to-copy fix command.
 
-![Panel preview: one expanded repo section showing two npm findings with
-severity, CVE/GHSA links, and copy-fix commands, plus two collapsed
-sections below showing their severity-count summaries](preview.png)
+![Panel preview: the project list, seven repos each showing a
+severity-count summary — a mix of critical/moderate findings, "no CVSS
+data" cases, and a clean repo — with the supported-ecosystems caption and
+scan/settings icons at the top](preview.png)
 
 The screenshot above is a real capture against the plugin's own demo data
-(project labels literally say "remove me" — that's this repo's own
-throwaway test fixtures, not a hint about anything). Top section expanded:
-two real advisories against an intentionally old `minimist`, one moderate
-and one critical, each with its own CVE-preferred link and copy-fix
-command. Below it, two collapsed sections — a clean repo, and one with a
-single moderate cargo finding — showing what the severity-count summary
-line looks like without expanding anything.
+(the `scratch-*` labels are this repo's own throwaway test fixtures, one
+intentionally-vulnerable project per supported ecosystem — not a hint
+about anything). Each row is exactly what the list shows without opening
+anything: severity dot, label, path, and a severity-count summary —
+including "no CVSS data" for advisories (cargo's RustSec entries, mostly)
+that never got a severity assigned at all, shown distinctly from a real
+low/moderate/high/critical rating. Click any row to open its findings in
+the dedicated detail view described below.
 
 ## Install
 
