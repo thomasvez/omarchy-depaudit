@@ -164,6 +164,45 @@ Panel {
   readonly property string stateDir: Quickshell.env("HOME") + "/.local/state/omarchy-depaudit"
   property var lastSeenMap: ({})
 
+  // Guards a predictable path: before this FileView is ever pointed at
+  // the real state.json, a one-time bash check confirms it's either
+  // absent or a plain regular file under maxStateFileBytes — not a
+  // symlink (dangling or not) another local process could have placed
+  // there to redirect our read/write somewhere else, and not an
+  // implausibly large file. This is a check-then-use, not a fully atomic
+  // guard (QML's FileView exposes no O_NOFOLLOW-equivalent) — a real but
+  // meaningfully narrower window than doing no check at all, and stays
+  // false (rather than the check itself risking a bad read) if anything
+  // looks wrong. persistState() below also refuses to write until this
+  // passes, so a failed check blocks both directions, not just loading.
+  readonly property int maxStateFileBytes: 1 * 1024 * 1024
+  property bool stateFileVerified: false
+
+  Component.onCompleted: stateCheckProc.running = true
+
+  Process {
+    id: stateCheckProc
+    command: ["bash", "-c",
+      "p=" + Util.shellQuote(root.stateDir + "/state.json") + "; " +
+      "if [ -L \"$p\" ]; then echo unsafe; " +
+      "elif [ ! -e \"$p\" ]; then echo safe; " +
+      "elif [ ! -f \"$p\" ]; then echo unsafe; " +
+      "else size=$(stat -c%s \"$p\" 2>/dev/null || echo 0); " +
+      "if [ \"$size\" -gt " + root.maxStateFileBytes + " ]; then echo unsafe; else echo safe; fi; fi"
+    ]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (String(text || "").trim() === "safe") {
+          root.stateFileVerified = true
+          stateFile.path = root.stateDir + "/state.json"
+        } else {
+          root.applyState("")
+        }
+      }
+    }
+  }
+
   function applyState(raw) {
     var parsed = null
     try { parsed = JSON.parse(raw) } catch (e) { parsed = null }
@@ -171,12 +210,13 @@ Panel {
   }
 
   function persistState() {
+    if (!root.stateFileVerified) return
     stateFile.setText(JSON.stringify({ lastSeen: root.lastSeenMap }, null, 2) + "\n")
   }
 
   FileView {
     id: stateFile
-    path: root.stateDir + "/state.json"
+    path: ""
     watchChanges: false
     printErrors: false
     onLoaded: root.applyState(text())
@@ -202,6 +242,23 @@ Panel {
       newProjectsProc.running || newAuditProc.running
   }
 
+  // ---- Hard cap on collected stdout — StdioCollector itself has no size
+  //      limit, so without this a malicious project or a compromised
+  //      registry/advisory response one of the real audit tools fetches
+  //      could make the shell retain and try to parse an arbitrarily
+  //      large result, exhausting memory. Called from every process's
+  //      StdioCollector.onDataChanged (which fires incrementally as
+  //      output streams in, not just once at the end) — the first call
+  //      that crosses Model.MAX_COLLECTED_BYTES kills the process
+  //      immediately via SIGKILL rather than waiting for it to exit on
+  //      its own. `proc.overflowed` is checked (and reset) in that
+  //      process's own onStreamFinished, in place of the normal parse.
+  function enforceOutputCap(proc, collectedLength) {
+    if (proc.overflowed || collectedLength <= Model.MAX_COLLECTED_BYTES) return
+    proc.overflowed = true
+    proc.signal(9)
+  }
+
   function refresh() {
     if (root.anyProcRunning()) return
     // Shows the project list immediately instead of leaving it blank
@@ -224,10 +281,17 @@ Panel {
 
   Process {
     id: discoveryProc
+    property bool overflowed: false
     stdout: StdioCollector {
       waitForEnd: true
+      onDataChanged: root.enforceOutputCap(discoveryProc, text.length)
       onStreamFinished: {
-        root.discoveredProjects = Model.parseDiscoveredProjects(String(text || ""))
+        // An oversized `find` listing is discarded rather than parsed
+        // (a truncated line could name a bogus path) — discoveredProjects
+        // just isn't updated this cycle, and the already-known projects
+        // still get re-audited normally below.
+        if (!discoveryProc.overflowed) root.discoveredProjects = Model.parseDiscoveredProjects(String(text || ""))
+        discoveryProc.overflowed = false
         root.rawRepos = Model.buildPendingRepos(root.effectiveProjects, root.rawRepos)
         root.runAudit()
       }
@@ -246,10 +310,15 @@ Panel {
 
   Process {
     id: auditProc
+    property bool overflowed: false
     stdout: StdioCollector {
       waitForEnd: true
+      onDataChanged: root.enforceOutputCap(auditProc, text.length)
       onStreamFinished: {
-        var scanned = Model.parseAuditOutput(String(text || ""), root.effectiveProjects)
+        var scanned = auditProc.overflowed
+          ? Model.buildOversizedOutputRepos(root.effectiveProjects)
+          : Model.parseAuditOutput(String(text || ""), root.effectiveProjects)
+        auditProc.overflowed = false
         root.rawRepos = scanned
         root.refreshing = false
         root.lastRefreshedAt = Date.now()
@@ -278,13 +347,21 @@ Panel {
 
   Process {
     id: singleProc
+    property bool overflowed: false
     stdout: StdioCollector {
       waitForEnd: true
+      onDataChanged: root.enforceOutputCap(singleProc, text.length)
       onStreamFinished: {
         var idx = root.singleRefreshIndex
         root.singleRefreshIndex = -1
-        if (idx < 0 || idx >= root.effectiveProjects.length || idx >= root.rawRepos.length) return
-        var updated = Model.parseAuditOutput(String(text || ""), [root.effectiveProjects[idx]])
+        if (idx < 0 || idx >= root.effectiveProjects.length || idx >= root.rawRepos.length) {
+          singleProc.overflowed = false
+          return
+        }
+        var updated = singleProc.overflowed
+          ? Model.buildOversizedOutputRepos([root.effectiveProjects[idx]])
+          : Model.parseAuditOutput(String(text || ""), [root.effectiveProjects[idx]])
+        singleProc.overflowed = false
         var next = root.rawRepos.slice()
         next[idx] = updated[0]
         root.rawRepos = next
@@ -319,9 +396,19 @@ Panel {
 
   Process {
     id: newProjectsProc
+    property bool overflowed: false
     stdout: StdioCollector {
       waitForEnd: true
+      onDataChanged: root.enforceOutputCap(newProjectsProc, text.length)
       onStreamFinished: {
+        // Same reasoning as discoveryProc: an oversized `find` listing is
+        // discarded rather than parsed, rather than risking a truncated
+        // path.
+        if (newProjectsProc.overflowed) {
+          newProjectsProc.overflowed = false
+          root.newProjectsStatus = "Discovery output exceeded the safety limit — try again"
+          return
+        }
         var knownPaths = {}
         for (var i = 0; i < root.rawRepos.length; i++) knownPaths[root.rawRepos[i].path] = true
         root.discoveredProjects = Model.parseDiscoveredProjects(String(text || ""))
@@ -348,12 +435,17 @@ Panel {
 
   Process {
     id: newAuditProc
+    property bool overflowed: false
     stdout: StdioCollector {
       waitForEnd: true
+      onDataChanged: root.enforceOutputCap(newAuditProc, text.length)
       onStreamFinished: {
         var fresh = root.pendingNewProjects
         root.pendingNewProjects = []
-        var scanned = Model.parseAuditOutput(String(text || ""), fresh)
+        var scanned = newAuditProc.overflowed
+          ? Model.buildOversizedOutputRepos(fresh)
+          : Model.parseAuditOutput(String(text || ""), fresh)
+        newAuditProc.overflowed = false
 
         // refreshOne/singleProc index a repo by its position in
         // effectiveProjects, so rawRepos must stay ordered the same way —
@@ -407,6 +499,7 @@ Panel {
     if (repo.status === "missing-tool") return "'" + repo.tool + "' not found on PATH — install it to audit this repo"
     if (repo.status === "unrecognized") return "No recognized manifest (package.json / Cargo.toml / requirements.txt / pyproject.toml / go.mod / Gemfile.lock / *.csproj)"
     if (repo.status === "parse-error") return "Could not parse audit output"
+    if (repo.status === "output-too-large") return "Audit output exceeded the safety limit and was stopped — a dependency, registry response, or this project itself may be misbehaving; try again or check it manually"
     if (repo.status === "ok" && repo.findings.length === 0) return "No known vulnerabilities"
     return ""
   }
@@ -545,6 +638,7 @@ Panel {
         spacing: Style.space(8)
 
         Text {
+          textFormat: Text.PlainText
           text: "[" + Model.severityLabel(findingItem.finding.severity) + "]"
           color: Model.severityColor(findingItem.finding.severity) || Qt.darker(findingItem.fg, 1.5)
           font.family: findingItem.fontFam
@@ -553,6 +647,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: findingItem.finding.package + (findingItem.finding.fixedVersion
             ? ("  " + findingItem.finding.range + " → " + findingItem.finding.fixedVersion)
             : ("  " + findingItem.finding.range))
@@ -566,6 +661,7 @@ Panel {
         //      of the row's background copy-fix area since this Text is a
         //      descendant of findingCol, declared after findingArea.
         Text {
+          textFormat: Text.PlainText
           visible: findingItem.finding.id !== ""
           text: findingItem.finding.id
           color: idArea.containsMouse ? Color.accent : Qt.darker(Color.accent, 1.2)
@@ -584,6 +680,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: text !== ""
         text: findingItem.finding.title
         color: Qt.darker(findingItem.fg, 1.5)
@@ -594,6 +691,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         text: "Copy fix: " + findingItem.finding.fixCommand
         color: Color.accent
         font.family: findingItem.fontFam
@@ -663,6 +761,7 @@ Panel {
               spacing: Style.space(8)
 
               Text {
+                textFormat: Text.PlainText
                 text: root.total > 0
                   ? (root.total + " finding" + (root.total === 1 ? "" : "s") + " · worst: " + Model.severityLabel(root.worstSeverity))
                   : "No known dependency findings"
@@ -673,6 +772,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.refreshing
                 text: "refreshing…"
                 color: Qt.darker(root.fg, 1.5)
@@ -683,6 +783,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: !root.refreshing && root.newProjectsStatus !== ""
                 text: root.newProjectsStatus
                 color: Qt.darker(root.fg, 1.5)
@@ -699,6 +800,7 @@ Panel {
             // discoverRoots is actually configured; a bare `projects` list
             // has nothing for it to discover.
             Text {
+              textFormat: Text.PlainText
               id: scanNewBtn
               visible: !root.settingsOpen && root.discoverRoots.length > 0
               anchors.right: settingsBtn.left
@@ -720,6 +822,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               id: settingsBtn
               anchors.right: parent.right
               anchors.verticalCenter: mainHeaderRow.verticalCenter
@@ -743,6 +846,7 @@ Panel {
           // populated) — a first-glance answer to "what does this even
           // audit", not buried in the README.
           Text {
+            textFormat: Text.PlainText
             text: Model.supportedEcosystemsText()
             color: Qt.darker(root.fg, 1.5)
             font.family: root.fontFam
@@ -756,6 +860,7 @@ Panel {
             spacing: Style.space(10)
 
             Text {
+              textFormat: Text.PlainText
               text: "Widget settings"
               color: root.fg
               font.family: root.fontFam
@@ -764,6 +869,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.settingsError !== ""
               text: root.settingsError
               color: Model.severityColor("critical")
@@ -774,6 +880,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Icon"
               color: Qt.darker(root.fg, 1.4)
               font.family: root.fontFam
@@ -796,6 +903,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Discover roots — one absolute directory per line"
               color: Qt.darker(root.fg, 1.4)
               font.family: root.fontFam
@@ -810,6 +918,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Projects — one per line: \"label | path\" or just \"path\""
               color: Qt.darker(root.fg, 1.4)
               font.family: root.fontFam
@@ -842,6 +951,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: !root.settingsOpen && root.effectiveProjects.length === 0
             text: "No projects configured. Click the ⚙ above to add some, or\nedit this widget's entry in ~/.config/omarchy/shell.json —\nsee the plugin README."
             color: Qt.darker(root.fg, 1.5)
@@ -936,6 +1046,7 @@ Panel {
                     spacing: Style.space(8)
 
                     Text {
+                      textFormat: Text.PlainText
                       text: "❯"
                       color: headerArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
                       font.family: root.fontFam
@@ -953,6 +1064,7 @@ Panel {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       text: repoSection.modelData.label
                       color: root.fg
                       font.family: root.fontFam
@@ -962,6 +1074,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     anchors.left: labelRow.right
                     anchors.leftMargin: Style.space(8)
                     anchors.right: parent.right
@@ -975,6 +1088,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   id: rescanBtn
                   anchors.right: parent.right
                   anchors.verticalCenter: headerLeft.verticalCenter
@@ -1004,6 +1118,7 @@ Panel {
                   model: ["critical", "high", "moderate", "low", "unknown"]
 
                   Text {
+                    textFormat: Text.PlainText
                     required property string modelData
                     visible: repoSection.counts[modelData] > 0
                     text: repoSection.counts[modelData] + " " + Model.severityLabel(modelData)
@@ -1016,6 +1131,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.statusLabel(repoSection.modelData) !== ""
                 text: root.statusLabel(repoSection.modelData)
                 color: Qt.darker(root.fg, 1.5)
@@ -1053,6 +1169,7 @@ Panel {
                 spacing: Style.space(10)
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "‹ Back"
                   color: detailBackArea.containsMouse ? Color.accent : Qt.darker(root.fg, 1.3)
                   font.family: root.fontFam
@@ -1070,6 +1187,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   text: root.detailRepo ? root.detailRepo.label : root.detailPath
                   color: root.fg
                   font.family: root.fontFam
@@ -1080,6 +1198,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: detailRescanBtn
                 anchors.right: parent.right
                 anchors.verticalCenter: detailBackRow.verticalCenter
@@ -1100,6 +1219,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.detailRepo !== null
               text: root.detailPath
               color: Qt.darker(root.fg, 1.6)
@@ -1110,6 +1230,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.detailRepo === null
               text: "This project is no longer in the list."
               color: Qt.darker(root.fg, 1.5)
@@ -1144,6 +1265,7 @@ Panel {
                   border.color: Color.accent
 
                   Text {
+                    textFormat: Text.PlainText
                     id: chipLabel
                     anchors.centerIn: parent
                     text: Model.severityLabel(chip.modelData) + " (" + chip.chipCount + ")"
@@ -1164,6 +1286,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.detailRepo !== null && root.detailFiltered.length === 0
               text: root.detailSeverity === "all" ? "No findings." : "No " + Model.severityLabel(root.detailSeverity) + " findings."
               color: Qt.darker(root.fg, 1.5)
@@ -1192,6 +1315,7 @@ Panel {
               spacing: Style.space(14)
 
               Text {
+                textFormat: Text.PlainText
                 text: "‹ Prev"
                 color: root.detailPaged.page > 0
                   ? (detailPrevArea.containsMouse ? Color.accent : root.fg)
@@ -1211,6 +1335,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: "Page " + (root.detailPaged.page + 1) + " of " + root.detailPaged.pageCount + " · " + root.detailPaged.total + " findings"
                 color: Qt.darker(root.fg, 1.5)
                 font.family: root.fontFam
@@ -1218,6 +1343,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: "Next ›"
                 color: root.detailPaged.page < root.detailPaged.pageCount - 1
                   ? (detailNextArea.containsMouse ? Color.accent : root.fg)

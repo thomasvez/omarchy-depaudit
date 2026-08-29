@@ -243,6 +243,39 @@ function buildPendingRepos(projects, existingRepos) {
   return out
 }
 
+// Hard cap on how much stdout a single generated script's process may
+// accumulate before Panel.qml kills it — StdioCollector has no built-in
+// limit of its own, and a malicious project (or a compromised registry/
+// advisory response one of the real audit tools fetches) could otherwise
+// make the shell retain and try to parse an arbitrarily large result,
+// exhausting memory. Calibrated against real data, not a guess: a real
+// (legitimate, non-malicious) large yarn monorepo audited during this
+// project's own development produced 30.4 MB of raw output — a cap set
+// too low would break real large repos, not just stop hostile ones. 100
+// MiB leaves that real case more than 3x headroom while still bounding
+// worst-case memory to something finite.
+var MAX_COLLECTED_BYTES = 100 * 1024 * 1024
+
+// Repo list to show when a script's output was killed for exceeding
+// MAX_COLLECTED_BYTES — every project that was part of that run reports a
+// bounded, honest error instead of the shell silently keeping stale data
+// or attempting to parse a truncated/garbage result.
+function buildOversizedOutputRepos(projects) {
+  var out = []
+  for (var i = 0; i < projects.length; i++) {
+    var p = projects[i]
+    out.push({
+      label: plainText(p.label || p.path || ""),
+      path: String(p.path || ""),
+      manager: "error",
+      status: "output-too-large",
+      findings: [],
+      worstSeverity: "none"
+    })
+  }
+  return out
+}
+
 function parseRepoBlock(label, path, manager, body) {
   var base = { label: plainText(label), path: path, manager: manager }
 
@@ -1163,6 +1196,8 @@ if (typeof module !== "undefined") {
     buildAuditScript: buildAuditScript,
     parseAuditOutput: parseAuditOutput,
     buildPendingRepos: buildPendingRepos,
+    MAX_COLLECTED_BYTES: MAX_COLLECTED_BYTES,
+    buildOversizedOutputRepos: buildOversizedOutputRepos,
     parseNpmAudit: parseNpmAudit,
     parsePnpmAudit: parsePnpmAudit,
     parseYarnAudit: parseYarnAudit,

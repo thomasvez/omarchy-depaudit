@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.11.1
+
+Fixes three issues raised by the Omarchy plugin marketplace's security
+review during submission.
+
+- Hard cap on collected audit/discovery output (100 MiB): StdioCollector
+  has no size limit of its own, so a malicious project or a compromised
+  registry/advisory response one of the real audit tools fetches could
+  otherwise make the shell retain and try to parse an arbitrarily large
+  result, exhausting memory. Every generated script's process is now
+  killed (SIGKILL) the moment its collected output crosses the cap, and
+  every project that was part of that run reports a distinct, bounded
+  "output-too-large" status instead. 100 MiB is calibrated against real
+  data, not a guess — a real (legitimate, non-malicious) large yarn
+  monorepo audited during this project's own development produced 30.4 MB
+  of raw output, so a lower cap would have broken real repos, not just
+  stopped hostile ones.
+- Forced `textFormat: Text.PlainText` on every Text element that can
+  render registry/project-controlled strings (package names, versions,
+  advisory ids/titles, fix commands, repo labels, paths) — Qt's default
+  rich-text handling can otherwise interpret crafted markup in that data
+  (including loading external resources via `<img>`), which a malicious
+  package name or advisory title could exploit.
+- Guarded the predictable `state.json` path against a symlink (dangling
+  or not) or an implausibly large file placed there before the plugin
+  ever runs: a one-time check now confirms it's either absent or a plain
+  regular file under 1 MiB before this FileView is ever pointed at the
+  real path, and before any write is allowed through it.
+- Found and fixed a real bug in the output-cap fix itself while verifying
+  it live: the cap check used `QByteArray.length`, which isn't a reliable
+  JS-exposed property via this QML binding — every process was being
+  killed on its very first byte of output, breaking the whole plugin
+  (empty project list). Switched to the guaranteed-correct `text.length`
+  (the collector's JS string) and reverified against real data (a
+  325-finding scan across 4 real repos) before considering this done.
+- 1 new test (62 total).
+
 ## 0.11.0
 
 - Removed dismiss/ignore: this plugin's job is to surface what your audit

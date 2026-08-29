@@ -423,6 +423,16 @@ test("buildPendingRepos keeps existing results, placeholders anything not yet sc
   assert.equal(result[1].path, "/x/new")
 })
 
+test("buildOversizedOutputRepos reports every project with a distinct, bounded error status", () => {
+  const projects = [{ label: "a", path: "/x/a" }, { path: "/x/b" }]
+  const repos = Model.buildOversizedOutputRepos(projects)
+  assert.equal(repos.length, 2)
+  assert.equal(repos[0].label, "a")
+  assert.equal(repos[0].status, "output-too-large")
+  assert.equal(repos[0].findings.length, 0)
+  assert.equal(repos[1].label, "/x/b", "falls back to path when label is missing")
+})
+
 // ---- Integration: buildAuditScript output actually runs in bash ----------
 //
 // Doesn't require any of the six audit tools to be installed — the paths
