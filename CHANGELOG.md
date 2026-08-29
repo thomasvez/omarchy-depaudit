@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.11.2
+
+Follow-up hardening after 0.11.1, found by doing an actual adversarial
+pass instead of stopping once the marketplace's three flagged issues were
+fixed — this plugin's whole job is parsing/displaying data fetched by
+tools from external registries and advisory databases, so it deserved
+one.
+
+- Desktop notifications (new-finding alerts) go through the raw
+  freedesktop `Notify` D-Bus call, which many notification daemons render
+  as markup per the spec's optional "body-markup" capability (`<b>`,
+  `<a href>`, even `<img src>`) — the same underlying risk as the
+  QML Text fix, just via the notification channel instead of the panel.
+  A malicious package name could otherwise inject that markup, up to
+  making the daemon fetch an attacker's image URL. `newFindingsSummary`
+  now strips `<>&` from package/id the same way repo labels already were.
+- Advisory `url` fields open in the browser on click; most ecosystems'
+  come straight from their own registry/advisory response, unvalidated —
+  only ever hand an `http(s)://` URL to `omarchy-launch-browser` now,
+  so a compromised/malicious advisory entry can't open a local `file://`
+  path or some other locally-resolvable scheme.
+- `lastSeenMap` (new-finding baselines) only ever grew — a repo removed
+  from config/discovery kept its entry forever. Now pruned to the current
+  project list after every scan, which matters more now that state.json
+  has a size cap (0.11.1): an install that discovers/removes many
+  projects over a long lifetime could otherwise organically grow past it.
+  Verified live: pruned 22 stale accumulated entries down to the 4
+  actually-configured projects on the next refresh.
+- 2 new tests (64 total).
+
 ## 0.11.1
 
 Fixes three issues raised by the Omarchy plugin marketplace's security

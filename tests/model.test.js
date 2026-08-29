@@ -562,6 +562,15 @@ test("computeNewFindings: a single-repo call preserves other repos' baselines un
   assert.deepEqual(nextLastSeen["/repo/b"], ["CVE-9"])
 })
 
+test("pruneLastSeen drops entries for repos no longer configured/discovered", () => {
+  // Without this, a repo removed from config keeps its baseline forever
+  // — state.json (now size-capped) grows without bound over a
+  // long-lived install with many come-and-go projects.
+  const lastSeen = { "/repo/a": ["CVE-1"], "/repo/removed": ["CVE-2"] }
+  const pruned = Model.pruneLastSeen(lastSeen, ["/repo/a"])
+  assert.deepEqual(pruned, { "/repo/a": ["CVE-1"] })
+})
+
 test("newFindingsSummary names up to 2 findings and counts the rest", () => {
   assert.equal(Model.newFindingsSummary([]), "")
   const one = [{ finding: { package: "requests", id: "CVE-1" } }]
@@ -573,6 +582,14 @@ test("newFindingsSummary names up to 2 findings and counts the rest", () => {
     { finding: { package: "d", id: "CVE-4" } }
   ]
   assert.equal(Model.newFindingsSummary(four), "4 new findings: a (CVE-1), b (CVE-2) +2 more")
+})
+
+test("newFindingsSummary strips markup-forming characters from package/id (notification body-markup risk)", () => {
+  const malicious = [{ finding: { package: '<img src="x" onerror="evil">evilpkg', id: "CVE-1" } }]
+  const summary = Model.newFindingsSummary(malicious)
+  assert.ok(!summary.includes("<"), "no '<' should survive into a notification body")
+  assert.ok(!summary.includes(">"), "no '>' should survive into a notification body")
+  assert.equal(summary, '1 new finding: img src="x" onerror="evil"evilpkg (CVE-1)')
 })
 
 // ---- Auto-discovery --------------------------------------------------

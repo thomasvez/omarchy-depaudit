@@ -231,7 +231,9 @@ Panel {
   // "new" (that would notify on every fresh install).
   function checkNewFindings(scannedRepos) {
     var result = Model.computeNewFindings(scannedRepos, root.lastSeenMap)
-    root.lastSeenMap = result.nextLastSeen
+    var currentPaths = []
+    for (var i = 0; i < root.effectiveProjects.length; i++) currentPaths.push(root.effectiveProjects[i].path)
+    root.lastSeenMap = Model.pruneLastSeen(result.nextLastSeen, currentPaths)
     if (result.newFindings.length > 0 && root.bar)
       root.bar.run("omarchy-notification-send " + Util.shellQuote(Model.newFindingsSummary(result.newFindings)))
     root.persistState()
@@ -487,9 +489,17 @@ Panel {
     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
   }
 
+  // Most ecosystems' advisory `url` is a page we construct ourselves from
+  // a validated slug (cargo -> rustsec.org, ruby -> rubysec.com); the
+  // rest (npm/pnpm/yarn/dotnet) pass through whatever their own
+  // registry/advisory response put in that field, unvalidated. shellQuote
+  // stops it from breaking out of the shell command, but says nothing
+  // about the URL's own scheme — only ever hand http(s) off to the
+  // browser, so a compromised/malicious advisory entry can't make this
+  // open a local file:// path or some other locally-resolvable scheme.
   function openFindingUrl(url) {
     var text = String(url || "")
-    if (text === "" || !root.bar) return
+    if (!/^https?:\/\//i.test(text) || !root.bar) return
     root.bar.run("omarchy-launch-browser " + Util.shellQuote(text))
   }
 

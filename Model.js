@@ -947,16 +947,47 @@ function computeNewFindings(repos, lastSeenMap) {
   return { newFindings: newFindings, nextLastSeen: nextLastSeen }
 }
 
+// Drops any lastSeenMap entry whose repo path isn't in currentPaths.
+// computeNewFindings above only ever *adds to or refreshes* entries — a
+// repo removed from config/discovery keeps its baseline forever
+// otherwise, so state.json grows without bound over a long-lived install
+// with many come-and-go projects. Safe to call after any scan (full or
+// single-repo): currentPaths should always be the full current
+// effectiveProjects list, not just whatever was in this particular scan
+// batch, so a single-repo rescan doesn't wrongly drop every other repo's
+// baseline — only a repo no longer configured/discovered at all loses
+// its entry.
+function pruneLastSeen(lastSeenMap, currentPaths) {
+  var keep = {}
+  for (var i = 0; i < currentPaths.length; i++) keep[currentPaths[i]] = true
+  var next = {}
+  for (var k in lastSeenMap) {
+    if (keep[k]) next[k] = lastSeenMap[k]
+  }
+  return next
+}
+
 // Notification text for a batch of new findings — names up to 2 by package,
 // "+N more" beyond that, so the toast stays short regardless of how many
 // showed up at once.
+// plainText() on package/id: this string goes into a desktop notification
+// sent over the standard freedesktop Notify D-Bus call, which many
+// notification daemons render as markup per the spec's optional
+// "body-markup" capability (<b>, <a href="...">, even <img src="...">) —
+// a malicious package name could otherwise inject that markup, up to and
+// including making the daemon fetch an attacker's image URL. Same
+// underlying risk class as unescaped registry/project data reaching a
+// QML Text element, just via the notification channel instead of the
+// in-panel one.
 function newFindingsSummary(newFindings) {
   if (!newFindings || newFindings.length === 0) return ""
   var word = newFindings.length === 1 ? "new finding" : "new findings"
   var names = []
   for (var i = 0; i < Math.min(2, newFindings.length); i++) {
     var f = newFindings[i].finding
-    names.push(f.package + (f.id ? " (" + f.id + ")" : ""))
+    var pkg = plainText(f.package)
+    var id = plainText(f.id)
+    names.push(pkg + (id ? " (" + id + ")" : ""))
   }
   var extra = newFindings.length > 2 ? " +" + (newFindings.length - 2) + " more" : ""
   return newFindings.length + " " + word + ": " + names.join(", ") + extra
@@ -1219,6 +1250,7 @@ if (typeof module !== "undefined") {
     parseRootsText: parseRootsText,
     rootsToText: rootsToText,
     computeNewFindings: computeNewFindings,
+    pruneLastSeen: pruneLastSeen,
     newFindingsSummary: newFindingsSummary,
     buildDiscoveryScript: buildDiscoveryScript,
     parseDiscoveredProjects: parseDiscoveredProjects,
