@@ -45,6 +45,24 @@ test("plainText strips markup-smuggling characters only", () => {
   assert.equal(Model.plainText(null), "")
 })
 
+test("findSafePath prefixes anything not already absolute with ./, leaving absolute paths untouched", () => {
+  // A discoverRoot/project path of exactly "-delete" would otherwise make
+  // `find` treat it as its own -delete primary (no path argument at all,
+  // defaulting to searching "." and deleting every file found there)
+  // instead of a path — see findSafePath's own comment.
+  assert.equal(Model.findSafePath("-delete"), "./-delete")
+  assert.equal(Model.findSafePath("-exec rm -rf ~ ;"), "./-exec rm -rf ~ ;")
+  assert.equal(Model.findSafePath("/home/user/project"), "/home/user/project")
+  assert.equal(Model.findSafePath(""), "./")
+})
+
+test("clipboardSafeText strips newlines and control characters, leaves normal text alone", () => {
+  assert.equal(Model.clipboardSafeText("npm install pkg@1.0.0"), "npm install pkg@1.0.0")
+  assert.equal(Model.clipboardSafeText("npm install pkg@1.0.0\n; rm -rf ~"), "npm install pkg@1.0.0; rm -rf ~")
+  assert.equal(Model.clipboardSafeText("a\r\nb\x00c"), "abc")
+  assert.equal(Model.clipboardSafeText(null), "")
+})
+
 // ---- pickCveAlias --------------------------------------------------------
 
 test("pickCveAlias prefers a real CVE id and ignores GHSA/others", () => {
@@ -184,6 +202,16 @@ test("parseJsonStream tolerates braces inside quoted strings", () => {
   const stream = '{"text":"a { b } c"}{"n":2}'
   const objects = Model.parseJsonStream(stream)
   assert.deepEqual(objects, [{ text: "a { b } c" }, { n: 2 }])
+})
+
+test("parseJsonStream recovers after a stray unmatched closing brace instead of dropping everything after it", () => {
+  // Regression test: an unclamped depth counter would go negative on the
+  // stray "}", permanently desyncing depth === 0 for every later,
+  // genuinely well-formed object — silently losing all of them, not just
+  // the one immediately after the stray brace.
+  const stream = '}{"a":1}{"b":2}'
+  const objects = Model.parseJsonStream(stream)
+  assert.deepEqual(objects, [{ a: 1 }, { b: 2 }])
 })
 
 // ---- Real fixture parsing -------------------------------------------------
@@ -401,10 +429,44 @@ test("parseAuditOutput: malformed JSON body yields parse-error, not a crash", ()
   assert.equal(repos[0].findings.length, 0)
 })
 
+test("parseAuditOutput: a schema surprise in one repo (valid JSON, unexpected shape) doesn't abort the whole batch", () => {
+  // Regression test: valid JSON but a shape parseNpmAudit doesn't expect
+  // (a null entry where an object was always assumed) throws a
+  // TypeError deep inside the parser — uncaught, that would propagate out
+  // of parseAuditOutput and abort parsing every *other* repo in the same
+  // batch, not just this one.
+  const projects = [{ label: "a", path: "/x/a" }, { label: "b", path: "/x/b" }]
+  const raw = Model.REPO_MARKER + "0|npm\n" + JSON.stringify({ vulnerabilities: { pkg: null } })
+    + "\n" + Model.REPO_MARKER + "1|npm\n" + fixture("npm-audit.json")
+  const repos = Model.parseAuditOutput(raw, projects)
+  assert.equal(repos[0].status, "parse-error")
+  assert.equal(repos[1].status, "ok", "repo 1 must still parse normally despite repo 0's crash")
+  assert.ok(repos[1].findings.length > 0)
+})
+
 test("parseAuditOutput: a project with no matching chunk stays pending", () => {
   const projects = [{ label: "never ran", path: "/x/a" }]
   const repos = Model.parseAuditOutput("", projects)
   assert.equal(repos[0].status, "pending")
+})
+
+test("parseAuditOutput isn't desynced by the marker text appearing inside body content", () => {
+  // Regression test: a plain text.split(REPO_MARKER) would treat the bare
+  // marker substring anywhere in a tool's own output (e.g. an advisory
+  // title mentioning it) as a real chunk boundary, corrupting every
+  // subsequent repo's parsing — proven by tracing through what the old
+  // split-based implementation actually did with this exact input: repo
+  // 1's real marker+content gets absorbed into a bogus, discarded chunk,
+  // and repo 1 never gets parsed at all (stays "pending" instead of
+  // reporting its real "unrecognized" status).
+  const projects = [{ label: "a", path: "/x/a" }, { label: "b", path: "/x/b" }]
+  const raw = Model.REPO_MARKER + "0|unknown\n"
+    + "some tool output mentioning " + Model.REPO_MARKER + " in a title, not a real marker\n"
+    + Model.REPO_MARKER + "1|unknown\n"
+    + "repo 1's own output"
+  const repos = Model.parseAuditOutput(raw, projects)
+  assert.equal(repos[0].status, "unrecognized")
+  assert.equal(repos[1].status, "unrecognized", "repo 1's real marker must still be found, not swallowed by the fake one")
 })
 
 test("buildPendingRepos keeps existing results, placeholders anything not yet scanned", () => {

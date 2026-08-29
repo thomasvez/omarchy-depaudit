@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.11.3
+
+Fixes from an independent security review the maintainer ran separately
+(all five verified against the actual code before fixing, not taken on
+faith):
+
+- **High**: a discoverRoot or project path of exactly `-delete` (a real
+  `find` primitive needing no further arguments) would make `find`
+  default to searching the generated script's own working directory and
+  delete every file found there — `find` treats a bare leading-dash
+  argument as an option/predicate, not a path, regardless of shellQuote's
+  shell-level quoting. Every path is documented to already be absolute,
+  which is itself unambiguous to `find`, but nothing enforced that.
+  Prefixes anything not already starting with `/` with `./` before it
+  ever reaches `find` (or `cd`, which has the same ambiguity, confirmed
+  live: `cd -delete-test` errors "invalid option" instead of entering the
+  directory).
+- **Medium**: a fix command's package name/version — sourced from a
+  registry/advisory response — could contain an embedded newline; pasting
+  the copied clipboard text into a terminal would run whatever followed
+  the newline as its own command the instant Enter is hit, before ever
+  being reviewed as one line. Strips newlines/control characters before
+  anything reaches the clipboard.
+- **Low**: `text.split(REPO_MARKER)` would treat the bare marker
+  substring anywhere in a tool's own output (an advisory title, say) as a
+  real chunk boundary, corrupting every subsequent repo's parsing.
+  Rewrote to require the exact marker-line shape (`MARKER<index>|
+  <manager>\n`) `markerEcho` actually produces, not just the substring.
+  1 new test traces through exactly what the old code did with this
+  input to prove the corruption was real (a repo's real result got
+  silently swallowed into a discarded bogus chunk).
+- **Low**: an ecosystem parser hitting a valid-but-unexpected JSON shape
+  (e.g. a null entry where an object was always assumed) threw an
+  uncaught TypeError that aborted parsing every *other* repo in the same
+  batch, not just the one with the surprising response. The whole parser
+  dispatch is now one try/catch — one repo degrades to "parse-error"
+  instead of the batch failing.
+- **Informational**: `parseJsonStream`'s brace-depth counter could go
+  negative on a stray unmatched `}` before any real object, permanently
+  desyncing it — every later, well-formed object would then be silently
+  dropped too, not just the one after the stray brace. Clamped at 0.
+- 5 new tests (69 total). Reverified the core parsing rewrite against a
+  real 30.4 MB yarn audit afterward (314 real findings, matching exactly)
+  since it touches the path every scan goes through.
+
 ## 0.11.2
 
 Follow-up hardening after 0.11.1, found by doing an actual adversarial

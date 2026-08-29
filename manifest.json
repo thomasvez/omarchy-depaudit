@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.thomasvez.depaudit",
   "name": "Dependency Audit",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "author": "Thomas Vezirop (thomasvez)",
   "license": "MIT",
   "description": "Bar badge aggregating dependency security/staleness (CVEs, outdated packages) across your projects. Supports npm, pnpm, yarn, cargo, pip, Go, Ruby, and .NET — auto-detects each project's package manager (or finds projects on its own via discoverRoots) and shells out to its native audit tool: npm/pnpm/yarn audit, cargo-audit, pip-audit, govulncheck, bundler-audit, dotnet list package --vulnerable.",

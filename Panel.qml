@@ -484,7 +484,7 @@ Panel {
   }
 
   function copyFixCommand(command) {
-    var text = String(command || "")
+    var text = Model.clipboardSafeText(command)
     if (text === "") return
     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text) + " | wl-copy"])
   }

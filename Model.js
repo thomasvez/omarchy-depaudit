@@ -21,11 +21,42 @@ function shellQuote(value) {
   return "'" + String(value === null || value === undefined ? "" : value).replace(/'/g, "'\\''") + "'"
 }
 
+// GNU/POSIX find treats a bare argument starting with "-" as an option or
+// predicate, not a path, when it's in path-list position — shellQuote
+// only prevents the shell from splitting/expanding the string, it says
+// nothing about how find itself interprets a fully-formed single token.
+// A discoverRoot or project path of exactly "-delete" (a real find
+// primary needing no further arguments to match) would make find default
+// to searching "." — the generated script's own working directory — and
+// delete every file found there, since find never actually receives a
+// path argument at all. Every path here is documented to already be
+// absolute (starts with "/"), which is itself unambiguous to find, but
+// nothing currently enforces that; prefixing anything that doesn't
+// already start with "/" with "./" guarantees the result can never be
+// mistaken for an option, and is a no-op for any already-correct
+// absolute path.
+function findSafePath(path) {
+  var p = String(path || "")
+  return p.charAt(0) === "/" ? p : ("./" + p)
+}
+
 // Sanitized because Text elements with AutoText rich-text-parse a crafted
 // setting (e.g. a label containing "<img src=...>"). Strips the characters
 // that could smuggle markup into the long-lived shell process.
 function plainText(value) {
   return String(value === null || value === undefined ? "" : value).replace(/[<>&]/g, "")
+}
+
+// A fix command (e.g. "npm install pkg@version") is built from package
+// name/version fields that ultimately come from a registry or advisory
+// response, then copied to the clipboard as-is on click. If one of those
+// fields ever contained an embedded newline, pasting the copied text into
+// a terminal would run whatever followed the newline as its own command
+// the instant Enter is hit — before the user ever gets to review it as a
+// single line. Strips newlines and other control characters before
+// anything reaches the clipboard.
+function clipboardSafeText(value) {
+  return String(value === null || value === undefined ? "" : value).replace(/[\r\n\x00-\x1f]/g, "")
 }
 
 // No example paths: unlike a timezone list, project paths are inherently
@@ -94,7 +125,11 @@ function buildAuditScript(projects) {
   for (var i = 0; i < projects.length; i++) {
     var path = String(projects[i].path || "")
     if (path === "") continue
-    var qPath = shellQuote(path)
+    // findSafePath: qPath is used as a bare `find`/`cd` argument below
+    // (the .NET detection branch's `find $qPath -maxdepth 1 ...` in
+    // particular) — see findSafePath's own comment for why an
+    // unprefixed dash-leading path is dangerous there specifically.
+    var qPath = shellQuote(findSafePath(path))
 
     parts.push(
       // Checked before anything else: every branch below assumes the path
@@ -188,18 +223,27 @@ function buildAuditScript(projects) {
 // the shell's stdout.
 function parseAuditOutput(raw, projects) {
   var text = String(raw || "")
-  var chunks = text.split(REPO_MARKER)
+  // Anchored to the exact marker-line shape `markerEcho` produces
+  // (MARKER<index>|<manager>\n), not just the bare marker substring —
+  // a plain text.split(REPO_MARKER) would desync every chunk boundary
+  // after it if any tool's own output (an advisory title, a package
+  // description) ever happened to contain the literal marker text.
+  // Requiring the immediate `\d+|...\n` structure makes that
+  // indistinguishable-by-accident.
+  var markerLine = new RegExp(REPO_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(\\d+)\\|([^\\n]*)\\n", "g")
+  var matches = []
+  var m
+  while ((m = markerLine.exec(text)) !== null) {
+    matches.push({ index: parseInt(m[1], 10), manager: m[2], bodyStart: markerLine.lastIndex, matchStart: m.index })
+  }
+
   var byIndex = {}
-  for (var i = 1; i < chunks.length; i++) {
-    var chunk = chunks[i]
-    var nl = chunk.indexOf("\n")
-    var head = nl === -1 ? chunk : chunk.substring(0, nl)
-    var body = nl === -1 ? "" : chunk.substring(nl + 1)
-    var sep = head.indexOf("|")
-    var index = parseInt(sep === -1 ? head : head.substring(0, sep), 10)
-    var manager = sep === -1 ? "unknown" : head.substring(sep + 1)
+  for (var i = 0; i < matches.length; i++) {
+    var bodyEnd = (i + 1 < matches.length) ? matches[i + 1].matchStart : text.length
+    var body = text.substring(matches[i].bodyStart, bodyEnd)
+    var index = matches[i].index
     if (isNaN(index) || !projects[index]) continue
-    byIndex[index] = parseRepoBlock(projects[index].label || projects[index].path, projects[index].path, manager, body)
+    byIndex[index] = parseRepoBlock(projects[index].label || projects[index].path, projects[index].path, matches[i].manager, body)
   }
 
   var results = []
@@ -299,25 +343,35 @@ function parseRepoBlock(label, path, manager, body) {
   // no separator, yarn newline-delimits one object per line — so both are
   // parsed straight from the raw text rather than through the single
   // JSON.parse the other managers use.
+  //
+  // The whole dispatch below (JSON.parse included) is wrapped in one
+  // try/catch: JSON.parse failing was already handled, but every
+  // individual parseXAudit function assumes its ecosystem's normal shape
+  // and reads straight into nested fields — a real tool emitting a
+  // schema variant we haven't seen (a null entry where an object was
+  // expected, a missing array) would throw a TypeError instead of just
+  // failing to find any findings. Uncaught, that would propagate out of
+  // parseAuditOutput entirely and abort parsing every *other* repo in the
+  // same batch too, not just this one. One bad/unexpected response
+  // degrades to a single "parse-error" repo instead.
   var findings
-  if (manager === "go") {
-    findings = parseGoAudit(body)
-  } else if (manager === "yarn") {
-    findings = parseYarnAudit(body)
-  } else {
-    var json = null
-    try {
-      json = JSON.parse(body)
-    } catch (e) {
-      return Object.assign(base, { status: "parse-error", findings: [], worstSeverity: "none" })
+  try {
+    if (manager === "go") {
+      findings = parseGoAudit(body)
+    } else if (manager === "yarn") {
+      findings = parseYarnAudit(body)
+    } else {
+      var json = JSON.parse(body)
+      if (manager === "npm") findings = parseNpmAudit(json)
+      else if (manager === "pnpm") findings = parsePnpmAudit(json)
+      else if (manager === "cargo") findings = parseCargoAudit(json)
+      else if (manager === "pip") findings = parsePipAudit(json)
+      else if (manager === "ruby") findings = parseRubyAudit(json)
+      else if (manager === "dotnet") findings = parseDotnetAudit(json)
+      else findings = []
     }
-    if (manager === "npm") findings = parseNpmAudit(json)
-    else if (manager === "pnpm") findings = parsePnpmAudit(json)
-    else if (manager === "cargo") findings = parseCargoAudit(json)
-    else if (manager === "pip") findings = parsePipAudit(json)
-    else if (manager === "ruby") findings = parseRubyAudit(json)
-    else if (manager === "dotnet") findings = parseDotnetAudit(json)
-    else findings = []
+  } catch (e) {
+    return Object.assign(base, { status: "parse-error", findings: [], worstSeverity: "none" })
   }
 
   return Object.assign(base, {
@@ -635,10 +689,19 @@ function parseJsonStream(text) {
       if (depth === 0) start = i
       depth++
     } else if (ch === "}") {
-      depth--
-      if (depth === 0 && start !== -1) {
-        try { objects.push(JSON.parse(str.substring(start, i + 1))) } catch (e) { /* skip malformed chunk */ }
-        start = -1
+      // Clamped at 0 rather than going negative: a stray unmatched "}"
+      // before any real object (stray warning text on stdout, say) would
+      // otherwise desync depth permanently — every *later*, genuinely
+      // well-formed object's matching "}" would land on some depth other
+      // than 0, so the `depth === 0` check below would never fire again
+      // and every remaining object in the stream would be silently
+      // dropped, not just the one after the stray brace.
+      if (depth > 0) {
+        depth--
+        if (depth === 0 && start !== -1) {
+          try { objects.push(JSON.parse(str.substring(start, i + 1))) } catch (e) { /* skip malformed chunk */ }
+          start = -1
+        }
       }
     }
   }
@@ -1021,7 +1084,7 @@ function buildDiscoveryScript(roots) {
   for (var i = 0; i < roots.length; i++) {
     var root = String(roots[i] || "")
     if (root === "") continue
-    var qRoot = shellQuote(root)
+    var qRoot = shellQuote(findSafePath(root))
     parts.push(
       "find " + qRoot + " -maxdepth 5 " +
       "\\( -name node_modules -o -name .git -o -name target -o -name vendor " +
@@ -1219,6 +1282,8 @@ if (typeof module !== "undefined") {
   module.exports = {
     REPO_MARKER: REPO_MARKER,
     shellQuote: shellQuote,
+    findSafePath: findSafePath,
+    clipboardSafeText: clipboardSafeText,
     pickCveAlias: pickCveAlias,
     plainText: plainText,
     defaultProjects: defaultProjects,
